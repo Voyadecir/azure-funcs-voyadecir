@@ -5,10 +5,13 @@
       "type": "httpTrigger",
       "direction": "in",
       "name": "req",
-      "methods": [ "post" ],
+      "methods": [ "post", "options" ],
       "route": "mailbills/parse"
     },
-    { "type": "http", "direction": "out", "name": "res" }
-  ],
-  "scriptFile": "__init__.py"
+    {
+      "type": "http",
+      "direction": "out",
+      "name": "res"
+    }
+  ]
 }
