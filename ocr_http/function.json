@@ -1,11 +1,12 @@
 {
+  "scriptFile": "__init__.py",
   "bindings": [
     {
       "authLevel": "anonymous",
       "type": "httpTrigger",
       "direction": "in",
       "name": "req",
-      "methods": [ "post", "options" ],
+      "methods": ["post", "options"],
       "route": "mailbills/parse"
     },
     {
