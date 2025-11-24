@@ -8,11 +8,6 @@
       "name": "req",
       "methods": ["post", "options"],
       "route": "mailbills/parse"
-    },
-    {
-      "type": "http",
-      "direction": "out",
-      "name": "res"
     }
   ]
 }
