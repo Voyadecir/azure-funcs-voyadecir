@@ -131,9 +131,10 @@ def _run_azure_ocr_stdlib(body_bytes: bytes, target_lang: str) -> Dict[str, Any]
         }
 
     endpoint = endpoint.rstrip("/")
+    # IMPORTANT: correct URL – no _overload param
     analyze_url = (
         f"{endpoint}/documentintelligence/documentModels/{model_id}:analyze"
-        f"?_overload=analyzeDocument&api-version={api_version}"
+        f"?api-version={api_version}"
     )
 
     debug_steps.append(f"Stage 0: Received {length} bytes.")
