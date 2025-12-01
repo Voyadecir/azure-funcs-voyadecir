@@ -1,3 +1,4 @@
 azure-functions
 httpx
 requests
+azure-ai-documentintelligence
