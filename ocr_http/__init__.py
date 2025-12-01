@@ -223,4 +223,135 @@ def _run_azure_ocr_httpx(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
         try:
             result_json = poll_resp.json()
         except Exception as e:
-            debug_steps.append_
+            debug_steps.append("Failed to parse polling JSON: {}".format(str(e)))
+            continue
+
+        status = result_json.get("status", "")
+        debug_steps.append("Stage 3 (attempt {}): status = {}".format(attempt + 1, status))
+
+        if status in ("succeeded", "failed", "partiallySucceeded"):
+            break
+
+    if not result_json:
+        return {
+            "ok": False,
+            "message": "Did not receive a valid JSON result from Azure OCR.",
+            "received_bytes": length,
+            "target_lang": target_lang,
+            "ocr_text_snippet": "",
+            "summary_translated": "",
+            "summary_en": "Azure OCR did not return a valid JSON result.",
+            "fields": _empty_fields(),
+            "debug": {
+                "stub": False,
+                "steps": debug_steps,
+            },
+        }
+
+    if status != "succeeded":
+        debug_steps.append("Final status from Azure OCR: {}".format(status))
+        return {
+            "ok": False,
+            "message": "Azure OCR did not succeed (status={}).".format(status),
+            "received_bytes": length,
+            "target_lang": target_lang,
+            "ocr_text_snippet": "",
+            "summary_translated": "",
+            "summary_en": "Azure OCR did not complete successfully (status={}).".format(status),
+            "fields": _empty_fields(),
+            "debug": {
+                "stub": False,
+                "steps": debug_steps,
+                "raw_status": status,
+            },
+        }
+
+    # Extract lines of text
+    lines = []
+    page_count = 0
+    try:
+        analyze_result = result_json.get("analyzeResult", {}) or {}
+        pages = analyze_result.get("pages", []) or []
+        page_count = len(pages)
+        for page in pages:
+            page_lines = page.get("lines", []) or []
+            for line in page_lines:
+                text = line.get("content") or ""
+                if text:
+                    lines.append(text)
+    except Exception as e:
+        logging.exception("Failed to parse Azure OCR analyzeResult.")
+        debug_steps.append("Failed to parse analyzeResult: {}".format(str(e)))
+
+    debug_steps.append(
+        "Stage 4: Extracted {} lines of text from {} page(s).".format(len(lines), page_count)
+    )
+
+    full_text = "\n".join(lines) if lines else ""
+    snippet = full_text[:500] if full_text else ""
+
+    return {
+        "ok": True,
+        "message": "OCR completed using Azure Document Intelligence REST API.",
+        "received_bytes": length,
+        "target_lang": target_lang,
+        "ocr_text_snippet": snippet,
+        "summary_translated": "",
+        "summary_en": (
+            "OCR succeeded using Azure Document Intelligence REST API. "
+            "Summary/translation fields will be populated once LLM is wired in."
+        ),
+        "fields": _empty_fields(),
+        "debug": {
+            "stub": False,
+            "rest": {
+                "model_id": model_id,
+                "api_version": api_version,
+                "page_count": page_count,
+                "line_count": len(lines),
+                "poll_attempts_used": attempt + 1 if length else 0,
+            },
+            "steps": debug_steps,
+        },
+    }
+
+
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    origin = req.headers.get("Origin")
+    logging.info("mailbills/parse triggered, method=%s, origin=%s", req.method, origin)
+
+    # CORS preflight
+    if req.method.upper() == "OPTIONS":
+        return func.HttpResponse("", status_code=204, headers=_cors_headers(origin))
+
+    # Only POST is supported (but keep HTTP 200 so the frontend doesn't explode)
+    if req.method.upper() != "POST":
+        payload = {
+            "ok": False,
+            "message": "Use POST with PDF or image bytes.",
+        }
+        return _json_response(payload, origin, status_code=200)
+
+    # Read body bytes
+    try:
+        body_bytes = req.get_body() or b""
+    except Exception as e:
+        logging.exception("Failed to read request body")
+        payload = {
+            "ok": False,
+            "message": "Could not read request body.",
+            "error": str(e),
+            "fields": _empty_fields(),
+        }
+        return _json_response(payload, origin, status_code=200)
+
+    target_lang = (req.params.get("target_lang") or "en").strip().lower() or "en"
+
+    logging.info(
+        "mailbills/parse received %d bytes, target_lang=%s",
+        len(body_bytes),
+        target_lang,
+    )
+
+    payload = _run_azure_ocr_httpx(body_bytes, target_lang)
+    return _json_response(payload, origin, status_code=200)
