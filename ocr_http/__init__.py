@@ -6,7 +6,15 @@ import time
 from typing import Dict, Any
 
 import azure.functions as func
-import httpx
+
+# Try to import requests safely
+try:
+    import requests
+    HAVE_REQUESTS = True
+    REQUESTS_IMPORT_ERROR = ""
+except Exception as e:
+    HAVE_REQUESTS = False
+    REQUESTS_IMPORT_ERROR = str(e)
 
 # Allowed CORS origins
 ALLOWED_ORIGINS = {"https://voyadecir.com", "https://www.voyadecir.com"}
@@ -42,7 +50,7 @@ def _empty_fields() -> Dict[str, Dict[str, Any]]:
     }
 
 
-def _run_azure_ocr_httpx(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
+def _run_azure_ocr_requests(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
     debug_steps = []
     length = len(body_bytes)
 
@@ -63,7 +71,27 @@ def _run_azure_ocr_httpx(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
             },
         }
 
-    # Read config from multiple possible env var names
+    if not HAVE_REQUESTS:
+        debug_steps.append("Python 'requests' package not available in Function environment.")
+        if REQUESTS_IMPORT_ERROR:
+            debug_steps.append("Import error: {}".format(REQUESTS_IMPORT_ERROR))
+        return {
+            "ok": False,
+            "message": "HTTP client library (requests) not available on the server.",
+            "received_bytes": length,
+            "target_lang": target_lang,
+            "ocr_text_snippet": "",
+            "summary_translated": "",
+            "summary_en": (
+                "The Python 'requests' package is not installed or failed to import. "
+                "Check requirements.txt for 'requests'."
+            ),
+            "fields": _empty_fields(),
+            "debug": {
+                "stub": False,
+                "steps": debug_steps,
+            },
+        }
 
     # Endpoint (supports both DI-style and DOCINTEL-style names)
     endpoint = (
@@ -137,8 +165,9 @@ def _run_azure_ocr_httpx(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
         "Ocp-Apim-Subscription-Key": key,
     }
 
+    # 1) Send analyze request
     try:
-        resp = httpx.post(analyze_url, headers=headers, json=request_payload, timeout=30.0)
+        resp = requests.post(analyze_url, headers=headers, json=request_payload, timeout=30.0)
     except Exception as e:
         logging.exception("REST call to Azure Document Intelligence failed.")
         debug_steps.append("REST call to analyze endpoint failed: {}".format(str(e)))
@@ -198,7 +227,7 @@ def _run_azure_ocr_httpx(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
 
     debug_steps.append("Stage 2: Operation-Location = {}".format(op_location))
 
-    # Poll for result
+    # 2) Poll for result
     status = "notStarted"
     result_json = None
     poll_headers = {"Ocp-Apim-Subscription-Key": key}
@@ -206,7 +235,7 @@ def _run_azure_ocr_httpx(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
     for attempt in range(poll_attempts):
         try:
             time.sleep(poll_wait)
-            poll_resp = httpx.get(op_location, headers=poll_headers, timeout=30.0)
+            poll_resp = requests.get(op_location, headers=poll_headers, timeout=30.0)
         except Exception as e:
             logging.exception("Polling Azure OCR result failed.")
             debug_steps.append("Polling failed on attempt {}: {}".format(attempt + 1, str(e)))
@@ -266,7 +295,7 @@ def _run_azure_ocr_httpx(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
             },
         }
 
-    # Extract lines of text
+    # 3) Extract lines of text
     lines = []
     page_count = 0
     try:
@@ -332,26 +361,38 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         }
         return _json_response(payload, origin, status_code=200)
 
-    # Read body bytes
     try:
-        body_bytes = req.get_body() or b""
+        # Read body bytes
+        try:
+            body_bytes = req.get_body() or b""
+        except Exception as e:
+            logging.exception("Failed to read request body")
+            payload = {
+                "ok": False,
+                "message": "Could not read request body.",
+                "error": str(e),
+                "fields": _empty_fields(),
+            }
+            return _json_response(payload, origin, status_code=200)
+
+        target_lang = (req.params.get("target_lang") or "en").strip().lower() or "en"
+
+        logging.info(
+            "mailbills/parse received %d bytes, target_lang=%s",
+            len(body_bytes),
+            target_lang,
+        )
+
+        payload = _run_azure_ocr_requests(body_bytes, target_lang)
+        return _json_response(payload, origin, status_code=200)
+
     except Exception as e:
-        logging.exception("Failed to read request body")
+        # Catch any unhandled error so we DO NOT 500 with empty body
+        logging.exception("Unhandled error in mailbills/parse.")
         payload = {
             "ok": False,
-            "message": "Could not read request body.",
+            "message": "Unhandled server error in mailbills/parse.",
             "error": str(e),
             "fields": _empty_fields(),
         }
         return _json_response(payload, origin, status_code=200)
-
-    target_lang = (req.params.get("target_lang") or "en").strip().lower() or "en"
-
-    logging.info(
-        "mailbills/parse received %d bytes, target_lang=%s",
-        len(body_bytes),
-        target_lang,
-    )
-
-    payload = _run_azure_ocr_httpx(body_bytes, target_lang)
-    return _json_response(payload, origin, status_code=200)
