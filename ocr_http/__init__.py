@@ -6,15 +6,8 @@ import time
 from typing import Dict, Any
 
 import azure.functions as func
-
-# Try to import requests safely
-try:
-    import requests
-    HAVE_REQUESTS = True
-    REQUESTS_IMPORT_ERROR = ""
-except Exception as e:
-    HAVE_REQUESTS = False
-    REQUESTS_IMPORT_ERROR = str(e)
+import urllib.request
+import urllib.error
 
 # Allowed CORS origins
 ALLOWED_ORIGINS = {"https://voyadecir.com", "https://www.voyadecir.com"}
@@ -50,7 +43,18 @@ def _empty_fields() -> Dict[str, Dict[str, Any]]:
     }
 
 
-def _run_azure_ocr_requests(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
+def _http_post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: float = 30.0):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _http_get(url: str, headers: Dict[str, str], timeout: float = 30.0):
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _run_azure_ocr_stdlib(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
     debug_steps = []
     length = len(body_bytes)
 
@@ -64,28 +68,6 @@ def _run_azure_ocr_requests(body_bytes: bytes, target_lang: str) -> Dict[str, An
             "ocr_text_snippet": "",
             "summary_translated": "",
             "summary_en": "No file data was received by the server.",
-            "fields": _empty_fields(),
-            "debug": {
-                "stub": False,
-                "steps": debug_steps,
-            },
-        }
-
-    if not HAVE_REQUESTS:
-        debug_steps.append("Python 'requests' package not available in Function environment.")
-        if REQUESTS_IMPORT_ERROR:
-            debug_steps.append("Import error: {}".format(REQUESTS_IMPORT_ERROR))
-        return {
-            "ok": False,
-            "message": "HTTP client library (requests) not available on the server.",
-            "received_bytes": length,
-            "target_lang": target_lang,
-            "ocr_text_snippet": "",
-            "summary_translated": "",
-            "summary_en": (
-                "The Python 'requests' package is not installed or failed to import. "
-                "Check requirements.txt for 'requests'."
-            ),
             "fields": _empty_fields(),
             "debug": {
                 "stub": False,
@@ -108,7 +90,7 @@ def _run_azure_ocr_requests(body_bytes: bytes, target_lang: str) -> Dict[str, An
         or os.getenv("DOCUMENTINTELLIGENCE_API_KEY")
         or os.getenv("AZURE_DI_API_KEY")
         or os.getenv("AZURE_DOCINTEL_API_KEY")
-        or os.getenv("AZURE_DOCINTEL_KEY")  # matches your current Function env var
+        or os.getenv("AZURE_DOCINTEL_KEY")  # matches your Function env var
         or ""
     )
 
@@ -154,8 +136,8 @@ def _run_azure_ocr_requests(body_bytes: bytes, target_lang: str) -> Dict[str, An
         f"?_overload=analyzeDocument&api-version={api_version}"
     )
 
-    debug_steps.append("Stage 0: Received {} bytes.".format(length))
-    debug_steps.append("Stage 1: Calling REST API {}".format(analyze_url))
+    debug_steps.append(f"Stage 0: Received {length} bytes.")
+    debug_steps.append(f"Stage 1: Calling REST API {analyze_url}")
 
     # Encode file as base64 and send as JSON to the REST API
     base64_doc = base64.b64encode(body_bytes).decode("ascii")
@@ -167,10 +149,30 @@ def _run_azure_ocr_requests(body_bytes: bytes, target_lang: str) -> Dict[str, An
 
     # 1) Send analyze request
     try:
-        resp = requests.post(analyze_url, headers=headers, json=request_payload, timeout=30.0)
+        resp = _http_post_json(analyze_url, headers, request_payload, timeout=30.0)
+        status_code = getattr(resp, "status", None) or resp.getcode()
+        resp_text = resp.read().decode("utf-8", "ignore")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore")
+        logging.exception("REST call to Azure Document Intelligence failed with HTTPError.")
+        debug_steps.append(f"REST call HTTPError {e.code}: {body[:500]}")
+        return {
+            "ok": False,
+            "message": "Azure OCR analyze request failed.",
+            "received_bytes": length,
+            "target_lang": target_lang,
+            "ocr_text_snippet": "",
+            "summary_translated": "",
+            "summary_en": f"Azure OCR analyze request failed with HTTP {e.code}.",
+            "fields": _empty_fields(),
+            "debug": {
+                "stub": False,
+                "steps": debug_steps,
+            },
+        }
     except Exception as e:
         logging.exception("REST call to Azure Document Intelligence failed.")
-        debug_steps.append("REST call to analyze endpoint failed: {}".format(str(e)))
+        debug_steps.append(f"REST call to analyze endpoint failed: {str(e)}")
         return {
             "ok": False,
             "message": "OCR failed while calling Azure Document Intelligence (analyze).",
@@ -186,11 +188,9 @@ def _run_azure_ocr_requests(body_bytes: bytes, target_lang: str) -> Dict[str, An
             },
         }
 
-    if resp.status_code not in (200, 202):
+    if status_code not in (200, 202):
         debug_steps.append(
-            "Analyze request returned HTTP {} with body: {}".format(
-                resp.status_code, resp.text[:500]
-            )
+            f"Analyze request returned HTTP {status_code} with body: {resp_text[:500]}"
         )
         return {
             "ok": False,
@@ -199,7 +199,7 @@ def _run_azure_ocr_requests(body_bytes: bytes, target_lang: str) -> Dict[str, An
             "target_lang": target_lang,
             "ocr_text_snippet": "",
             "summary_translated": "",
-            "summary_en": "Azure OCR analyze request failed with HTTP {}.".format(resp.status_code),
+            "summary_en": f"Azure OCR analyze request failed with HTTP {status_code}.",
             "fields": _empty_fields(),
             "debug": {
                 "stub": False,
@@ -207,7 +207,8 @@ def _run_azure_ocr_requests(body_bytes: bytes, target_lang: str) -> Dict[str, An
             },
         }
 
-    op_location = resp.headers.get("Operation-Location") or resp.headers.get("operation-location")
+    # Operation-Location header is not directly exposed by urllib, so we need to re-call headers from resp
+    op_location = resp.getheader("Operation-Location") or resp.getheader("operation-location")
     if not op_location:
         debug_steps.append("Operation-Location header missing in analyze response.")
         return {
@@ -225,7 +226,7 @@ def _run_azure_ocr_requests(body_bytes: bytes, target_lang: str) -> Dict[str, An
             },
         }
 
-    debug_steps.append("Stage 2: Operation-Location = {}".format(op_location))
+    debug_steps.append(f"Stage 2: Operation-Location = {op_location}")
 
     # 2) Poll for result
     status = "notStarted"
@@ -235,28 +236,35 @@ def _run_azure_ocr_requests(body_bytes: bytes, target_lang: str) -> Dict[str, An
     for attempt in range(poll_attempts):
         try:
             time.sleep(poll_wait)
-            poll_resp = requests.get(op_location, headers=poll_headers, timeout=30.0)
+            poll_resp = _http_get(op_location, poll_headers, timeout=30.0)
+            poll_status = getattr(poll_resp, "status", None) or poll_resp.getcode()
+            poll_text = poll_resp.read().decode("utf-8", "ignore")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")
+            logging.exception("Polling Azure OCR result failed with HTTPError.")
+            debug_steps.append(
+                f"Polling HTTPError {e.code} on attempt {attempt + 1}: {body[:500]}"
+            )
+            continue
         except Exception as e:
             logging.exception("Polling Azure OCR result failed.")
-            debug_steps.append("Polling failed on attempt {}: {}".format(attempt + 1, str(e)))
+            debug_steps.append(f"Polling failed on attempt {attempt + 1}: {str(e)}")
             continue
 
-        if poll_resp.status_code != 200:
+        if poll_status != 200:
             debug_steps.append(
-                "Polling HTTP {} with body: {}".format(
-                    poll_resp.status_code, poll_resp.text[:500]
-                )
+                f"Polling HTTP {poll_status} with body: {poll_text[:500]}"
             )
             continue
 
         try:
-            result_json = poll_resp.json()
+            result_json = json.loads(poll_text)
         except Exception as e:
-            debug_steps.append("Failed to parse polling JSON: {}".format(str(e)))
+            debug_steps.append(f"Failed to parse polling JSON: {str(e)}")
             continue
 
         status = result_json.get("status", "")
-        debug_steps.append("Stage 3 (attempt {}): status = {}".format(attempt + 1, status))
+        debug_steps.append(f"Stage 3 (attempt {attempt + 1}): status = {status}")
 
         if status in ("succeeded", "failed", "partiallySucceeded"):
             break
@@ -278,15 +286,15 @@ def _run_azure_ocr_requests(body_bytes: bytes, target_lang: str) -> Dict[str, An
         }
 
     if status != "succeeded":
-        debug_steps.append("Final status from Azure OCR: {}".format(status))
+        debug_steps.append(f"Final status from Azure OCR: {status}")
         return {
             "ok": False,
-            "message": "Azure OCR did not succeed (status={}).".format(status),
+            "message": f"Azure OCR did not succeed (status={status}).",
             "received_bytes": length,
             "target_lang": target_lang,
             "ocr_text_snippet": "",
             "summary_translated": "",
-            "summary_en": "Azure OCR did not complete successfully (status={}).".format(status),
+            "summary_en": f"Azure OCR did not complete successfully (status={status}).",
             "fields": _empty_fields(),
             "debug": {
                 "stub": False,
@@ -310,10 +318,10 @@ def _run_azure_ocr_requests(body_bytes: bytes, target_lang: str) -> Dict[str, An
                     lines.append(text)
     except Exception as e:
         logging.exception("Failed to parse Azure OCR analyzeResult.")
-        debug_steps.append("Failed to parse analyzeResult: {}".format(str(e)))
+        debug_steps.append(f"Failed to parse analyzeResult: {str(e)}")
 
     debug_steps.append(
-        "Stage 4: Extracted {} lines of text from {} page(s).".format(len(lines), page_count)
+        f"Stage 4: Extracted {len(lines)} lines of text from {page_count} page(s)."
     )
 
     full_text = "\n".join(lines) if lines else ""
@@ -383,7 +391,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             target_lang,
         )
 
-        payload = _run_azure_ocr_requests(body_bytes, target_lang)
+        payload = _run_azure_ocr_stdlib(body_bytes, target_lang)
         return _json_response(payload, origin, status_code=200)
 
     except Exception as e:
