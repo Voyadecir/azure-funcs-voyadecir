@@ -2,32 +2,25 @@ import json
 import logging
 import os
 import io
+from typing import Dict, Any
 
 import azure.functions as func
-from azure.core.credentials import AzureKeyCredential
-from azure.ai.documentintelligence import DocumentIntelligenceClient
 
 # Allowed CORS origins
 ALLOWED_ORIGINS = {"https://voyadecir.com", "https://www.voyadecir.com"}
 
-# Azure Document Intelligence config
-AZURE_DI_ENDPOINT = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
-AZURE_DI_KEY = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY")
-AZURE_DI_MODEL_ID = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_MODEL_ID", "prebuilt-read")
-
-document_intelligence_client: DocumentIntelligenceClient | None = None
-if AZURE_DI_ENDPOINT and AZURE_DI_KEY:
-    try:
-        document_intelligence_client = DocumentIntelligenceClient(
-            endpoint=AZURE_DI_ENDPOINT,
-            credential=AzureKeyCredential(AZURE_DI_KEY),
-        )
-        logging.info("Initialized Azure Document Intelligence client.")
-    except Exception:
-        logging.exception("Failed to initialize Document Intelligence client.")
+# Try to import Azure Document Intelligence, but don't crash if it's not installed.
+try:
+    from azure.core.credentials import AzureKeyCredential
+    from azure.ai.documentintelligence import DocumentIntelligenceClient
+    AZURE_DI_SUPPORTED = True
+    AZURE_DI_IMPORT_ERROR = ""
+except Exception as e:
+    AZURE_DI_SUPPORTED = False
+    AZURE_DI_IMPORT_ERROR = str(e)
 
 
-def _cors_headers(origin: str | None):
+def _cors_headers(origin):
     origin_ok = origin if origin in ALLOWED_ORIGINS else ""
     return {
         "Access-Control-Allow-Origin": origin_ok,
@@ -37,7 +30,7 @@ def _cors_headers(origin: str | None):
     }
 
 
-def _json_response(payload: dict, origin: str | None, status_code: int = 200) -> func.HttpResponse:
+def _json_response(payload: Dict[str, Any], origin, status_code: int = 200) -> func.HttpResponse:
     return func.HttpResponse(
         json.dumps(payload, ensure_ascii=False),
         status_code=status_code,
@@ -46,8 +39,8 @@ def _json_response(payload: dict, origin: str | None, status_code: int = 200) ->
     )
 
 
-def _empty_fields():
-    # Placeholder; we’ll fill this in later when we do real field extraction
+def _empty_fields() -> Dict[str, Dict[str, Any]]:
+    # Placeholder fields until we wire proper extraction
     return {
         "amount_due": {"value": "", "confidence": 0.0},
         "due_date": {"value": "", "confidence": 0.0},
@@ -57,11 +50,12 @@ def _empty_fields():
     }
 
 
-def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> dict:
-    debug_steps: list[str] = []
+def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
+    debug_steps = []
     length = len(body_bytes)
 
     if not body_bytes:
+        debug_steps.append("No bytes in request body.")
         return {
             "ok": False,
             "message": "Empty request body. Send PDF or image bytes.",
@@ -73,14 +67,50 @@ def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> dict:
             "fields": _empty_fields(),
             "debug": {
                 "stub": False,
-                "steps": ["No bytes in request body."],
+                "steps": debug_steps,
             },
         }
 
-    if document_intelligence_client is None:
+    if not AZURE_DI_SUPPORTED:
+        debug_steps.append("Azure Document Intelligence SDK import failed.")
+        if AZURE_DI_IMPORT_ERROR:
+            debug_steps.append("Import error: " + AZURE_DI_IMPORT_ERROR)
+        return {
+            "ok": False,
+            "message": "OCR SDK not available on the server.",
+            "received_bytes": length,
+            "target_lang": target_lang,
+            "ocr_text_snippet": "",
+            "summary_translated": "",
+            "summary_en": (
+                "The Azure Document Intelligence Python SDK is not installed or failed to import. "
+                "Check requirements.txt for 'azure-ai-documentintelligence'."
+            ),
+            "fields": _empty_fields(),
+            "debug": {
+                "stub": False,
+                "steps": debug_steps,
+            },
+        }
+
+    # Support either your custom env var names or the official ones
+    endpoint = (
+        os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
+        or os.getenv("DOCUMENTINTELLIGENCE_ENDPOINT")
+        or ""
+    )
+    key = (
+        os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY")
+        or os.getenv("DOCUMENTINTELLIGENCE_API_KEY")
+        or ""
+    )
+    model_id = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_MODEL_ID", "prebuilt-read")
+
+    if not endpoint or not key:
         debug_steps.append(
-            "Azure Document Intelligence client is not initialized. "
-            "Check AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT / AZURE_DOCUMENT_INTELLIGENCE_KEY env vars."
+            "Azure Document Intelligence endpoint/key missing. "
+            "Set AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT and AZURE_DOCUMENT_INTELLIGENCE_KEY "
+            "or DOCUMENTINTELLIGENCE_ENDPOINT and DOCUMENTINTELLIGENCE_API_KEY."
         )
         return {
             "ok": False,
@@ -100,37 +130,83 @@ def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> dict:
             },
         }
 
-    debug_steps.append(f"Stage 0: Received {length} bytes.")
-    debug_steps.append(f"Stage 1: Calling Azure Document Intelligence model '{AZURE_DI_MODEL_ID}'.")
+    debug_steps.append("Stage 0: Received {} bytes.".format(length))
+    debug_steps.append("Stage 1: Creating DocumentIntelligenceClient.")
 
-    # Call Azure AI Document Intelligence (prebuilt-read or whatever model you configure)
-    poller = document_intelligence_client.begin_analyze_document(
-        AZURE_DI_MODEL_ID,
-        body=io.BytesIO(body_bytes),
-    )
-    result = poller.result()
-    debug_steps.append("Stage 2: Azure returned result successfully.")
+    try:
+        client = DocumentIntelligenceClient(
+            endpoint=endpoint,
+            credential=AzureKeyCredential(key),
+        )
+    except Exception as e:
+        logging.exception("Failed to initialize DocumentIntelligenceClient.")
+        debug_steps.append("Failed to initialize DocumentIntelligenceClient: {}".format(str(e)))
+        return {
+            "ok": False,
+            "message": "Failed to initialize Azure Document Intelligence client.",
+            "received_bytes": length,
+            "target_lang": target_lang,
+            "ocr_text_snippet": "",
+            "summary_translated": "",
+            "summary_en": "Server error while initializing Azure OCR client.",
+            "fields": _empty_fields(),
+            "debug": {
+                "stub": False,
+                "steps": debug_steps,
+            },
+        }
 
-    # Collect text as simple lines
-    lines: list[str] = []
+    debug_steps.append("Stage 2: Calling Azure Document Intelligence model '{}'.".format(model_id))
+
+    try:
+        # Use BytesIO so it behaves like a file object
+        stream = io.BytesIO(body_bytes)
+        poller = client.begin_analyze_document(model_id, body=stream)
+        result = poller.result()
+        debug_steps.append("Stage 3: Azure returned result successfully.")
+    except Exception as e:
+        logging.exception("Azure OCR call failed.")
+        debug_steps.append("Azure OCR call failed: {}".format(str(e)))
+        return {
+            "ok": False,
+            "message": "OCR failed while calling Azure Document Intelligence.",
+            "received_bytes": length,
+            "target_lang": target_lang,
+            "ocr_text_snippet": "",
+            "summary_translated": "",
+            "summary_en": "Server error while running OCR. Check Azure Function logs.",
+            "fields": _empty_fields(),
+            "debug": {
+                "stub": False,
+                "steps": debug_steps,
+            },
+        }
+
+    # Collect text lines
+    lines = []
     page_count = 0
-    if result.pages:
-        page_count = len(result.pages)
-        for page in result.pages:
-            if page.lines:
-                for line in page.lines:
-                    lines.append(line.content)
+    try:
+        if getattr(result, "pages", None):
+            page_count = len(result.pages)
+            for page in result.pages:
+                if getattr(page, "lines", None):
+                    for line in page.lines:
+                        # Defensive: some SDK shapes use .content
+                        text = getattr(line, "content", "")
+                        if text:
+                            lines.append(text)
+    except Exception as e:
+        logging.exception("Failed to parse Azure OCR result.")
+        debug_steps.append("Failed to parse Azure OCR result: {}".format(str(e)))
 
-    full_text = "\n".join(lines)
     debug_steps.append(
-        f"Stage 3: Extracted {len(lines)} lines of text from {page_count} page(s)."
+        "Stage 4: Extracted {} lines of text from {} page(s).".format(len(lines), page_count)
     )
 
-    # For now we don’t do LLM summary; just say OCR succeeded,
-    # front-end still gets exactly the keys it expects.
+    full_text = "\n".join(lines) if lines else ""
     snippet = full_text[:500] if full_text else ""
 
-    payload = {
+    return {
         "ok": True,
         "message": "OCR completed with Azure Document Intelligence.",
         "received_bytes": length,
@@ -145,14 +221,13 @@ def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> dict:
         "debug": {
             "stub": False,
             "azure": {
-                "model_id": AZURE_DI_MODEL_ID,
+                "model_id": model_id,
                 "page_count": page_count,
                 "line_count": len(lines),
             },
             "steps": debug_steps,
         },
     }
-    return payload
 
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
@@ -171,7 +246,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         }
         return _json_response(payload, origin, status_code=200)
 
-    # Try to read body bytes
+    # Read body bytes
     try:
         body_bytes = req.get_body() or b""
     except Exception as e:
@@ -193,23 +268,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         target_lang,
     )
 
-    try:
-        payload = _run_azure_ocr(body_bytes, target_lang)
-    except Exception as e:
-        logging.exception("Azure OCR call failed.")
-        payload = {
-            "ok": False,
-            "message": "OCR failed while calling Azure Document Intelligence.",
-            "received_bytes": length,
-            "target_lang": target_lang,
-            "ocr_text_snippet": "",
-            "summary_translated": "",
-            "summary_en": "Server error while running OCR. Check Azure Function logs.",
-            "fields": _empty_fields(),
-            "debug": {
-                "stub": False,
-                "exception": str(e),
-            },
-        }
-
+    # Run OCR with full error handling
+    payload = _run_azure_ocr(body_bytes, target_lang)
     return _json_response(payload, origin, status_code=200)
