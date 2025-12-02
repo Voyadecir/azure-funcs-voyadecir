@@ -1,25 +1,15 @@
 import os
 import json
-import logging
 import azure.functions as func
 import urllib.request
 import urllib.error
 
-SPEECH_KEY    = os.getenv("AZURE_SPEECH_KEY", "").strip()
-SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "").strip()
-
-
-def _cors_headers():
-    return {
-        "Access-Control-Allow-Origin": "https://voyadecir.com",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
-    }
+SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "")
+SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "")
 
 
 def _ssml(text: str, lang: str, voice: str) -> str:
     if not voice:
-        # Default voice by language
         voice = "es-MX-DaliaNeural" if lang.lower().startswith("es") else "en-US-JennyNeural"
     lang_tag = "es-MX" if lang.lower().startswith("es") else "en-US"
     return f"""<speak version='1.0' xml:lang='{lang_tag}'>
@@ -28,99 +18,73 @@ def _ssml(text: str, lang: str, voice: str) -> str:
 
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("tts_http: request received, method=%s", req.method)
-
     # CORS preflight
     if req.method == "OPTIONS":
-        return func.HttpResponse(status_code=204, headers=_cors_headers())
+        return func.HttpResponse(status_code=204)
 
-    # Check config
+    # Basic guard on config
     if not SPEECH_KEY or not SPEECH_REGION:
-        logging.error("tts_http: missing AZURE_SPEECH_KEY or AZURE_SPEECH_REGION")
-        body = json.dumps({"error": "Server TTS config missing."})
         return func.HttpResponse(
-            body,
+            json.dumps({"error": "AZURE_SPEECH_KEY or AZURE_SPEECH_REGION not configured."}),
             status_code=500,
             mimetype="application/json",
-            headers=_cors_headers(),
         )
 
-    # Parse body
     try:
         data = req.get_json()
     except Exception:
         data = {}
 
-    text  = (data.get("text") or "").strip()
-    lang  = (data.get("lang") or "en-US").strip()
-    voice = (data.get("voice") or "").strip()
+    text = (data.get("text") or "").strip()
+    lang = data.get("lang", "en-US")
+    voice = data.get("voice", "")
 
     if not text:
-        body = json.dumps({"error": "No text provided."})
         return func.HttpResponse(
-            body,
+            json.dumps({"error": "No text provided."}),
             status_code=400,
             mimetype="application/json",
-            headers=_cors_headers(),
         )
 
-    # Build TTS request
     tts_url = f"https://{SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
-    ssml = _ssml(text, lang, voice)
-    logging.info(
-        "tts_http: calling TTS region=%s, lang=%s, voice=%s",
-        SPEECH_REGION,
-        lang,
-        voice or "(auto)",
-    )
-
-    req_headers = {
+    headers = {
         "Ocp-Apim-Subscription-Key": SPEECH_KEY,
         "Content-Type": "application/ssml+xml",
         "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
         "User-Agent": "voyadecir-tts",
     }
+    ssml = _ssml(text, lang, voice)
+    body_bytes = ssml.encode("utf-8")
 
-    http_req = urllib.request.Request(
-        tts_url,
-        data=ssml.encode("utf-8"),
-        headers=req_headers,
-        method="POST",
-    )
+    req_http = urllib.request.Request(tts_url, data=body_bytes, headers=headers, method="POST")
 
-    # Call Azure TTS
     try:
-        with urllib.request.urlopen(http_req, timeout=30) as resp:
-            audio_bytes = resp.read()
-            logging.info("tts_http: TTS success, bytes=%d", len(audio_bytes))
-            return func.HttpResponse(
-                body=audio_bytes,
-                status_code=200,
-                mimetype="audio/mpeg",
-                headers=_cors_headers(),
-            )
-
+        with urllib.request.urlopen(req_http, timeout=30.0) as resp:
+            audio = resp.read()
+            status = resp.getcode()
     except urllib.error.HTTPError as e:
-        # Read error body for debugging
-        try:
-            err_body = e.read().decode("utf-8", errors="ignore")
-        except Exception:
-            err_body = ""
-        logging.error("tts_http: HTTPError from TTS: %s %s", e.code, err_body)
-        body = json.dumps({"error": "TTS failed", "status": e.code})
+        detail = e.read().decode("utf-8", errors="ignore")
         return func.HttpResponse(
-            body,
+            json.dumps({"error": "TTS failed", "detail": detail}),
             status_code=500,
             mimetype="application/json",
-            headers=_cors_headers(),
+        )
+    except urllib.error.URLError as e:
+        return func.HttpResponse(
+            json.dumps({"error": "TTS network error", "detail": str(e)}),
+            status_code=500,
+            mimetype="application/json",
         )
 
-    except urllib.error.URLError as e:
-        logging.error("tts_http: URLError from TTS: %s", str(e))
-        body = json.dumps({"error": "TTS network error"})
+    if status >= 300:
         return func.HttpResponse(
-            body,
+            json.dumps({"error": "TTS failed", "status": status}),
             status_code=500,
             mimetype="application/json",
-            headers=_cors_headers(),
         )
+
+    return func.HttpResponse(
+        body=audio,
+        status_code=200,
+        mimetype="audio/mpeg",
+    )
