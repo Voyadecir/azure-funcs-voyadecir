@@ -1,4 +1,6 @@
 {
+  "scriptFile": "__init__.py",
+  "entryPoint": "main",
   "bindings": [
     {
       "authLevel": "anonymous",
@@ -11,7 +13,7 @@
     {
       "type": "http",
       "direction": "out",
-      "name": "res"
+      "name": "$return"
     }
   ]
 }
