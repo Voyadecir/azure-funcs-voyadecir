@@ -5,7 +5,9 @@ import time
 from typing import List, Dict, Any, Tuple, Optional
 
 import azure.functions as func
-import requests
+import urllib.request
+import urllib.error
+import urllib.parse
 
 logger = logging.getLogger("ocr_http")
 
@@ -20,19 +22,35 @@ def _json_response(body: Dict[str, Any], status_code: int = 200) -> func.HttpRes
 
 
 def _get_config() -> Dict[str, Any]:
-    """Read Azure Document Intelligence settings from environment."""
+    """
+    Read Azure Document Intelligence settings from environment.
+
+    Supports both:
+    - AZURE_DOCINTEL_* (your Function App settings)
+    - DOCINTEL_* / AZURE_DOCUMENT_INTELLIGENCE_* (for future flexibility)
+    """
     endpoint = (
         os.environ.get("DOCINTEL_ENDPOINT")
+        or os.environ.get("AZURE_DOCINTEL_ENDPOINT")
         or os.environ.get("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
         or ""
     )
     key = (
         os.environ.get("DOCINTEL_KEY")
+        or os.environ.get("AZURE_DOCINTEL_KEY")
         or os.environ.get("AZURE_DOCUMENT_INTELLIGENCE_KEY")
         or ""
     )
-    api_version = os.environ.get("DOCINTEL_API_VERSION") or "2023-07-31"
-    model_id = os.environ.get("DOCINTEL_MODEL_ID") or "prebuilt-read"
+    api_version = (
+        os.environ.get("DOCINTEL_API_VERSION")
+        or os.environ.get("AZURE_DOCINTEL_API_VERSION")
+        or "2024-02-29-preview"
+    )
+    model_id = (
+        os.environ.get("DOCINTEL_MODEL_ID")
+        or os.environ.get("AZURE_DOCINTEL_MODEL_ID")
+        or "prebuilt-read"
+    )
 
     return {
         "endpoint": endpoint.rstrip("/"),
@@ -40,6 +58,58 @@ def _get_config() -> Dict[str, Any]:
         "api_version": api_version,
         "model_id": model_id,
     }
+
+
+def _http_post(
+    url: str,
+    params: Dict[str, str],
+    headers: Dict[str, str],
+    data: bytes,
+    timeout: float = 30.0,
+) -> Tuple[int, bytes, Dict[str, str]]:
+    """
+    Simple POST using urllib (no third-party deps).
+    Returns (status_code, body_bytes, headers_dict).
+    """
+    if params:
+        query = urllib.parse.urlencode(params)
+        url = f"{url}?{query}"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.getcode()
+            body = resp.read()
+            resp_headers = dict(resp.getheaders())
+            return status, body, resp_headers
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        return e.code, body, dict(e.headers or {})
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"HTTP POST failed: {e}") from e
+
+
+def _http_get(
+    url: str,
+    headers: Dict[str, str],
+    timeout: float = 30.0,
+) -> Tuple[int, bytes, Dict[str, str]]:
+    """
+    Simple GET using urllib (no third-party deps).
+    Returns (status_code, body_bytes, headers_dict).
+    """
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.getcode()
+            body = resp.read()
+            resp_headers = dict(resp.getheaders())
+            return status, body, resp_headers
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        return e.code, body, dict(e.headers or {})
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"HTTP GET failed: {e}") from e
 
 
 def _analyze_document(
@@ -74,17 +144,23 @@ def _analyze_document(
 
     debug_steps.append(f"Calling analyze: {analyze_url}?api-version={api_version}")
 
-    resp = requests.post(analyze_url, params=params, headers=headers, data=data)
-    if resp.status_code != 202:
-        debug_steps.append(f"Analyze HTTP {resp.status_code}: {resp.text[:500]}")
+    status, body, resp_headers = _http_post(
+        analyze_url, params=params, headers=headers, data=data
+    )
+
+    if status != 202:
+        text_preview = body.decode("utf-8", errors="ignore")[:500]
+        debug_steps.append(f"Analyze HTTP {status}: {text_preview}")
         return None, {
             "ok": False,
-            "message": f"Analyze call failed with HTTP {resp.status_code}.",
-            "body_preview": resp.text[:500],
+            "message": f"Analyze call failed with HTTP {status}.",
+            "body_preview": text_preview,
         }
 
-    op_location = resp.headers.get("operation-location") or resp.headers.get(
-        "Operation-Location"
+    op_location = (
+        resp_headers.get("operation-location")
+        or resp_headers.get("Operation-Location")
+        or resp_headers.get("Operation-location")
     )
     debug_steps.append(f"operation-location: {op_location}")
     if not op_location:
@@ -112,23 +188,33 @@ def _poll_result(
 
     for attempt in range(15):
         debug_steps.append(f"Polling result attempt {attempt + 1}")
-        resp = requests.get(operation_url, headers=headers)
 
-        if resp.status_code != 200:
-            debug_steps.append(f"Poll HTTP {resp.status_code}: {resp.text[:500]}")
+        status, body, _ = _http_get(operation_url, headers=headers)
+
+        if status != 200:
+            text_preview = body.decode("utf-8", errors="ignore")[:500]
+            debug_steps.append(f"Poll HTTP {status}: {text_preview}")
             return None, {
                 "ok": False,
-                "message": f"Poll failed with HTTP {resp.status_code}.",
-                "body_preview": resp.text[:500],
+                "message": f"Poll failed with HTTP {status}.",
+                "body_preview": text_preview,
             }
 
-        data = resp.json()
-        status = data.get("status") or data.get("analyzeResult", {}).get("status")
-        debug_steps.append(f"status={status}")
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except Exception as e:
+            debug_steps.append(f"JSON decode error: {e}")
+            return None, {
+                "ok": False,
+                "message": "Failed to decode JSON from poll response.",
+            }
 
-        if status in ("succeeded", "Succeeded"):
+        status_field = data.get("status") or data.get("analyzeResult", {}).get("status")
+        debug_steps.append(f"status={status_field}")
+
+        if status_field in ("succeeded", "Succeeded"):
             return data, None
-        if status in ("failed", "Failed"):
+        if status_field in ("failed", "Failed"):
             return None, {
                 "ok": False,
                 "message": "Analyze operation reported failed.",
