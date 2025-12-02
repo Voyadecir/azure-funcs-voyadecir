@@ -1,172 +1,235 @@
-import json
 import logging
 import os
+import json
 import time
+from typing import List, Dict, Any, Tuple, Optional
 
 import azure.functions as func
-import urllib.request
-import urllib.error
+import requests
 
-ALLOWED_ORIGINS = {"https://voyadecir.com", "https://www.voyadecir.com"}
-
-
-def _cors_headers(origin):
-    origin_ok = origin if origin in ALLOWED_ORIGINS else ""
-    return {
-        "Access-Control-Allow-Origin": origin_ok,
-        "Access-Control-Allow-Credentials": "true",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
-    }
+logger = logging.getLogger("ocr_http")
 
 
-def _json_response(payload, origin, status_code=200):
+def _json_response(body: Dict[str, Any], status_code: int = 200) -> func.HttpResponse:
+    """Small helper to return JSON HTTP responses."""
     return func.HttpResponse(
-        json.dumps(payload, ensure_ascii=False),
+        body=json.dumps(body),
         status_code=status_code,
         mimetype="application/json",
-        headers=_cors_headers(origin),
     )
 
 
-def _empty_fields():
-    return {
-        "amount_due": {"value": "", "confidence": 0.0},
-        "due_date": {"value": "", "confidence": 0.0},
-        "account_number": {"value": "", "confidence": 0.0},
-        "sender": {"value": "", "confidence": 0.0},
-        "service_address": {"value": "", "confidence": 0.0},
-    }
-
-
-def _http_post_bytes(url, headers, body, timeout=30.0):
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    return urllib.request.urlopen(req, timeout=timeout)
-
-
-def _http_get(url, headers, timeout=30.0):
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    return urllib.request.urlopen(req, timeout=timeout)
-
-
-def _run_azure_ocr(body_bytes, target_lang):
-    debug_steps = []
-    length = len(body_bytes)
-
-    if not body_bytes:
-        debug_steps.append("No bytes in request body.")
-        return {
-            "ok": False,
-            "message": "Empty request body. Send PDF or image bytes.",
-            "received_bytes": 0,
-            "target_lang": target_lang,
-            "ocr_text_snippet": "",
-            "summary_translated": "",
-            "summary_en": "No file data was received by the server.",
-            "fields": _empty_fields(),
-            "debug": {"stub": False, "steps": debug_steps},
-        }
-
-    # Endpoint/key from env (handles multiple naming styles)
+def _get_config() -> Dict[str, Any]:
+    """Read Azure Document Intelligence settings from environment."""
     endpoint = (
-        os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
-        or os.getenv("DOCUMENTINTELLIGENCE_ENDPOINT")
-        or os.getenv("AZURE_DI_ENDPOINT")
-        or os.getenv("AZURE_DOCINTEL_ENDPOINT")
+        os.environ.get("DOCINTEL_ENDPOINT")
+        or os.environ.get("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
         or ""
     )
     key = (
-        os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY")
-        or os.getenv("DOCUMENTINTELLIGENCE_API_KEY")
-        or os.getenv("AZURE_DI_API_KEY")
-        or os.getenv("AZURE_DOCINTEL_API_KEY")
-        or os.getenv("AZURE_DOCINTEL_KEY")
+        os.environ.get("DOCINTEL_KEY")
+        or os.environ.get("AZURE_DOCUMENT_INTELLIGENCE_KEY")
         or ""
     )
+    api_version = os.environ.get("DOCINTEL_API_VERSION") or "2023-07-31"
+    model_id = os.environ.get("DOCINTEL_MODEL_ID") or "prebuilt-read"
 
-    # Stable v3.1 Form Recognizer
-    api_version = os.getenv("AZURE_DI_API_VERSION", "2023-07-31")
-    model_id = os.getenv("AZURE_DI_MODEL", "prebuilt-read")
+    return {
+        "endpoint": endpoint.rstrip("/"),
+        "key": key,
+        "api_version": api_version,
+        "model_id": model_id,
+    }
 
-    try:
-        poll_attempts = int(os.getenv("AZURE_DI_POLL_ATTEMPTS", "10"))
-    except ValueError:
-        poll_attempts = 10
-    try:
-        poll_wait = float(os.getenv("AZURE_DI_MAX_POLL_WAIT", "1.0"))
-    except ValueError:
-        poll_wait = 1.0
+
+def _analyze_document(
+    data: bytes,
+    content_type: str,
+    debug_steps: List[str],
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Call Azure Document Intelligence /formrecognizer/documentModels/{model_id}:analyze
+    and return the operation-location URL if successful.
+    """
+    cfg = _get_config()
+    endpoint = cfg["endpoint"]
+    key = cfg["key"]
+    api_version = cfg["api_version"]
+    model_id = cfg["model_id"]
 
     if not endpoint or not key:
-        debug_steps.append(
-            "Azure endpoint/key missing. "
-            "Checked AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT / DOCUMENTINTELLIGENCE_ENDPOINT / "
-            "AZURE_DI_ENDPOINT / AZURE_DOCINTEL_ENDPOINT and *_KEY/API_KEY."
-        )
-        return {
+        debug_steps.append("Missing endpoint or key in environment.")
+        return None, {
             "ok": False,
-            "message": "OCR is not configured on the server.",
-            "received_bytes": length,
-            "target_lang": target_lang,
-            "ocr_text_snippet": "",
-            "summary_translated": "",
-            "summary_en": (
-                "Azure OCR is not configured. The server is running, but endpoint/key "
-                "environment variables are missing or invalid."
-            ),
-            "fields": _empty_fields(),
-            "debug": {"stub": False, "steps": debug_steps},
+            "message": "Azure Document Intelligence endpoint or key is not configured.",
         }
 
-    endpoint_stripped = endpoint.rstrip("/")
-    analyze_url = (
-        endpoint_stripped
-        + "/formrecognizer/documentModels/"
-        + model_id
-        + ":analyze?api-version="
-        + api_version
-    )
-
-    debug_steps.append("Stage 0: Received %d bytes." % length)
-    debug_steps.append("Stage 1: Calling REST API %s" % analyze_url)
+    analyze_url = f"{endpoint}/formrecognizer/documentModels/{model_id}:analyze"
+    params = {"api-version": api_version}
 
     headers = {
-        "Content-Type": "application/octet-stream",
+        "Ocp-Apim-Subscription-Key": key,
+        "Content-Type": content_type or "application/octet-stream",
+    }
+
+    debug_steps.append(f"Calling analyze: {analyze_url}?api-version={api_version}")
+
+    resp = requests.post(analyze_url, params=params, headers=headers, data=data)
+    if resp.status_code != 202:
+        debug_steps.append(f"Analyze HTTP {resp.status_code}: {resp.text[:500]}")
+        return None, {
+            "ok": False,
+            "message": f"Analyze call failed with HTTP {resp.status_code}.",
+            "body_preview": resp.text[:500],
+        }
+
+    op_location = resp.headers.get("operation-location") or resp.headers.get(
+        "Operation-Location"
+    )
+    debug_steps.append(f"operation-location: {op_location}")
+    if not op_location:
+        return None, {
+            "ok": False,
+            "message": "Analyze call did not return operation-location header.",
+        }
+
+    return op_location, None
+
+
+def _poll_result(
+    operation_url: str,
+    debug_steps: List[str],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Poll the operation-location URL until status == succeeded or failed, or we time out.
+    """
+    cfg = _get_config()
+    key = cfg["key"]
+
+    headers = {
         "Ocp-Apim-Subscription-Key": key,
     }
 
-    # 1) Analyze request
+    for attempt in range(15):
+        debug_steps.append(f"Polling result attempt {attempt + 1}")
+        resp = requests.get(operation_url, headers=headers)
+
+        if resp.status_code != 200:
+            debug_steps.append(f"Poll HTTP {resp.status_code}: {resp.text[:500]}")
+            return None, {
+                "ok": False,
+                "message": f"Poll failed with HTTP {resp.status_code}.",
+                "body_preview": resp.text[:500],
+            }
+
+        data = resp.json()
+        status = data.get("status") or data.get("analyzeResult", {}).get("status")
+        debug_steps.append(f"status={status}")
+
+        if status in ("succeeded", "Succeeded"):
+            return data, None
+        if status in ("failed", "Failed"):
+            return None, {
+                "ok": False,
+                "message": "Analyze operation reported failed.",
+                "raw": data,
+            }
+
+        time.sleep(1.0)
+
+    return None, {
+        "ok": False,
+        "message": "Timed out waiting for analyze result.",
+    }
+
+
+def _extract_text(result: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Extract full text and a short snippet from the Azure result.
+    Supports both { content } and { analyzeResult: { content } } shapes.
+    """
+    full_text = ""
+    if "content" in result:
+        full_text = result.get("content") or ""
+    elif "analyzeResult" in result and isinstance(result["analyzeResult"], dict):
+        full_text = result["analyzeResult"].get("content") or ""
+
+    snippet = full_text[:1000]
+    return snippet, full_text
+
+
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    HTTP trigger entry point for OCR:
+    - Accepts binary body (PDF/image)
+    - Calls Azure Document Intelligence Read
+    - Polls until result is ready
+    - Returns OCR text + snippet + stub fields
+    """
+    debug_steps: List[str] = []
+
     try:
-        resp = _http_post_bytes(analyze_url, headers, body_bytes, timeout=30.0)
-        status_code = getattr(resp, "status", None) or resp.getcode()
-        resp_text = resp.read().decode("utf-8", "ignore")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "ignore")
-        debug_steps.append("REST call HTTPError %d: %s" % (e.code, body[:500]))
-        return {
-            "ok": False,
-            "message": "Azure OCR analyze request failed.",
-            "received_bytes": length,
-            "target_lang": target_lang,
-            "ocr_text_snippet": "",
+        body = req.get_body()
+        size = len(body or b"")
+        debug_steps.append(f"Received {size} bytes.")
+
+        if not body:
+            return _json_response(
+                {
+                    "ok": False,
+                    "message": "Request body is empty.",
+                    "debug": {"steps": debug_steps},
+                },
+                status_code=400,
+            )
+
+        content_type = req.headers.get("Content-Type", "application/octet-stream")
+
+        # 1) Start analyze
+        op_url, err = _analyze_document(body, content_type, debug_steps)
+        if err is not None:
+            err["debug"] = {"steps": debug_steps}
+            return _json_response(err, status_code=500)
+
+        # 2) Poll for result
+        result, err = _poll_result(op_url, debug_steps)
+        if err is not None:
+            err["debug"] = {"steps": debug_steps}
+            return _json_response(err, status_code=500)
+
+        # 3) Extract text
+        snippet, full_text = _extract_text(result)
+
+        response_body = {
+            "ok": True,
+            "message": "OCR succeeded.",
+            "ocr_text_snippet": snippet,
+            "ocr_text": full_text,
+            "summary_en": "",
             "summary_translated": "",
-            "summary_en": "Azure OCR analyze request failed with HTTP %d." % e.code,
-            "fields": _empty_fields(),
-            "debug": {"stub": False, "steps": debug_steps},
-        }
-    except Exception as e:
-        debug_steps.append("REST call to analyze endpoint failed: %s" % str(e))
-        return {
-            "ok": False,
-            "message": "OCR failed while calling Azure OCR analyze endpoint.",
-            "received_bytes": length,
-            "target_lang": target_lang,
-            "ocr_text_snippet": "",
-            "summary_translated": "",
-            "summary_en": "Server error while running OCR. Check Azure Function logs.",
-            "fields": _empty_fields(),
-            "debug": {"stub": False, "steps": debug_steps},
+            "fields": {
+                "amount_due": {"value": "", "confidence": 0.0},
+                "due_date": {"value": "", "confidence": 0.0},
+                "account_number": {"value": "", "confidence": 0.0},
+                "sender": {"value": "", "confidence": 0.0},
+                "service_address": {"value": "", "confidence": 0.0},
+            },
+            "debug": {
+                "steps": debug_steps,
+                "operation_url": op_url,
+            },
         }
 
-    if status_code not in (200, 202):
-        debug_steps.append_
+        return _json_response(response_body, status_code=200)
+
+    except Exception as exc:
+        logger.exception("Unhandled exception in ocr_http", exc_info=exc)
+        return _json_response(
+            {
+                "ok": False,
+                "message": "Unhandled exception in ocr_http.",
+                "error": str(exc),
+                "debug": {"steps": debug_steps},
+            },
+            status_code=500,
+        )
