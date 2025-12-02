@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 
 import azure.functions as func
 import urllib.request
@@ -28,42 +29,45 @@ def _json_response(payload, origin, status_code=200):
     )
 
 
+def _empty_fields():
+    return {
+        "amount_due": {"value": "", "confidence": 0.0},
+        "due_date": {"value": "", "confidence": 0.0},
+        "account_number": {"value": "", "confidence": 0.0},
+        "sender": {"value": "", "confidence": 0.0},
+        "service_address": {"value": "", "confidence": 0.0},
+    }
+
+
 def _http_post_bytes(url, headers, body, timeout=30.0):
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def main(req: func.HttpRequest) -> func.HttpResponse:
-    origin = req.headers.get("Origin")
-    logging.info("mailbills/parse TEST ANALYZE, method=%s, origin=%s", req.method, origin)
+def _http_get(url, headers, timeout=30.0):
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    return urllib.request.urlopen(req, timeout=timeout)
 
-    # CORS preflight
-    if req.method.upper() == "OPTIONS":
-        return func.HttpResponse("", status_code=204, headers=_cors_headers(origin))
 
-    # Only POST is supported
-    if req.method.upper() != "POST":
-        payload = {
-            "ok": False,
-            "message": "Use POST with PDF or image bytes. (TEST ANALYZE)",
-        }
-        return _json_response(payload, origin, status_code=200)
-
-    # Read body bytes
-    try:
-        body_bytes = req.get_body() or b""
-    except Exception as e:
-        logging.exception("TEST ANALYZE: Failed to read request body")
-        payload = {
-            "ok": False,
-            "message": "Could not read request body.",
-            "error": str(e),
-        }
-        return _json_response(payload, origin, status_code=200)
-
+def _run_azure_ocr(body_bytes, target_lang):
+    debug_steps = []
     length = len(body_bytes)
 
-    # Read env vars (same logic as debug)
+    if not body_bytes:
+        debug_steps.append("No bytes in request body.")
+        return {
+            "ok": False,
+            "message": "Empty request body. Send PDF or image bytes.",
+            "received_bytes": 0,
+            "target_lang": target_lang,
+            "ocr_text_snippet": "",
+            "summary_translated": "",
+            "summary_en": "No file data was received by the server.",
+            "fields": _empty_fields(),
+            "debug": {"stub": False, "steps": debug_steps},
+        }
+
+    # Endpoint/key from env (handles multiple naming styles)
     endpoint = (
         os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
         or os.getenv("DOCUMENTINTELLIGENCE_ENDPOINT")
@@ -79,83 +83,90 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         or os.getenv("AZURE_DOCINTEL_KEY")
         or ""
     )
+
+    # Stable v3.1 Form Recognizer
     api_version = os.getenv("AZURE_DI_API_VERSION", "2023-07-31")
     model_id = os.getenv("AZURE_DI_MODEL", "prebuilt-read")
 
-    endpoint_stripped = endpoint.rstrip("/") if endpoint else ""
-    analyze_url = ""
-    if endpoint_stripped:
-        analyze_url = (
-            f"{endpoint_stripped}/formrecognizer/documentModels/{model_id}:analyze"
-            f"?api-version={api_version}"
+    try:
+        poll_attempts = int(os.getenv("AZURE_DI_POLL_ATTEMPTS", "10"))
+    except ValueError:
+        poll_attempts = 10
+    try:
+        poll_wait = float(os.getenv("AZURE_DI_MAX_POLL_WAIT", "1.0"))
+    except ValueError:
+        poll_wait = 1.0
+
+    if not endpoint or not key:
+        debug_steps.append(
+            "Azure endpoint/key missing. "
+            "Checked AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT / DOCUMENTINTELLIGENCE_ENDPOINT / "
+            "AZURE_DI_ENDPOINT / AZURE_DOCINTEL_ENDPOINT and *_KEY/API_KEY."
         )
-
-    debug = {
-        "endpoint": endpoint,
-        "endpoint_stripped": endpoint_stripped,
-        "have_key": bool(key),
-        "api_version": api_version,
-        "model_id": model_id,
-        "analyze_url": analyze_url,
-        "received_bytes": length,
-    }
-
-    if not endpoint_stripped or not key:
-        payload = {
+        return {
             "ok": False,
-            "message": "Missing endpoint or key.",
-            "debug": debug,
+            "message": "OCR is not configured on the server.",
+            "received_bytes": length,
+            "target_lang": target_lang,
+            "ocr_text_snippet": "",
+            "summary_translated": "",
+            "summary_en": (
+                "Azure OCR is not configured. The server is running, but endpoint/key "
+                "environment variables are missing or invalid."
+            ),
+            "fields": _empty_fields(),
+            "debug": {"stub": False, "steps": debug_steps},
         }
-        return _json_response(payload, origin, status_code=200)
 
-    if not body_bytes:
-        payload = {
-            "ok": False,
-            "message": "Empty request body.",
-            "debug": debug,
-        }
-        return _json_response(payload, origin, status_code=200)
+    endpoint_stripped = endpoint.rstrip("/")
+    analyze_url = (
+        endpoint_stripped
+        + "/formrecognizer/documentModels/"
+        + model_id
+        + ":analyze?api-version="
+        + api_version
+    )
+
+    debug_steps.append("Stage 0: Received %d bytes." % length)
+    debug_steps.append("Stage 1: Calling REST API %s" % analyze_url)
 
     headers = {
         "Content-Type": "application/octet-stream",
         "Ocp-Apim-Subscription-Key": key,
     }
 
+    # 1) Analyze request
     try:
         resp = _http_post_bytes(analyze_url, headers, body_bytes, timeout=30.0)
         status_code = getattr(resp, "status", None) or resp.getcode()
         resp_text = resp.read().decode("utf-8", "ignore")
-        op_location = None
-        if hasattr(resp, "getheader"):
-            op_location = resp.getheader("Operation-Location") or resp.getheader("operation-location")
-
-        payload = {
-            "ok": True,
-            "message": "Analyze call completed.",
-            "http_status": status_code,
-            "operation_location": op_location,
-            "body_preview": resp_text[:1000],
-            "debug": debug,
-        }
-        return _json_response(payload, origin, status_code=200)
-
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", "ignore")
-        payload = {
+        debug_steps.append("REST call HTTPError %d: %s" % (e.code, body[:500]))
+        return {
             "ok": False,
-            "message": "Azure OCR analyze HTTPError.",
-            "http_status": e.code,
-            "body_preview": body[:1000],
-            "debug": debug,
+            "message": "Azure OCR analyze request failed.",
+            "received_bytes": length,
+            "target_lang": target_lang,
+            "ocr_text_snippet": "",
+            "summary_translated": "",
+            "summary_en": "Azure OCR analyze request failed with HTTP %d." % e.code,
+            "fields": _empty_fields(),
+            "debug": {"stub": False, "steps": debug_steps},
         }
-        return _json_response(payload, origin, status_code=200)
-
     except Exception as e:
-        logging.exception("Azure OCR analyze general error.")
-        payload = {
+        debug_steps.append("REST call to analyze endpoint failed: %s" % str(e))
+        return {
             "ok": False,
-            "message": "Azure OCR analyze general error.",
-            "error": str(e),
-            "debug": debug,
+            "message": "OCR failed while calling Azure OCR analyze endpoint.",
+            "received_bytes": length,
+            "target_lang": target_lang,
+            "ocr_text_snippet": "",
+            "summary_translated": "",
+            "summary_en": "Server error while running OCR. Check Azure Function logs.",
+            "fields": _empty_fields(),
+            "debug": {"stub": False, "steps": debug_steps},
         }
-        return _json_response(payload, origin, status_code=200)
+
+    if status_code not in (200, 202):
+        debug_steps.append_
