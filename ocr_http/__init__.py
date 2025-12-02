@@ -133,7 +133,7 @@ def _run_azure_ocr_stdlib(body_bytes: bytes, target_lang: str) -> Dict[str, Any]
 
     endpoint = endpoint.rstrip("/")
 
-    # IMPORTANT: use formrecognizer path for v3.1 (2023-07-31)
+    # Use formrecognizer path for v3.1 (2023-07-31)
     analyze_url = (
         f"{endpoint}/formrecognizer/documentModels/{model_id}:analyze"
         f"?api-version={api_version}"
@@ -210,7 +210,6 @@ def _run_azure_ocr_stdlib(body_bytes: bytes, target_lang: str) -> Dict[str, Any]
             },
         }
 
-    # Operation-Location header
     op_location = resp.getheader("Operation-Location") or resp.getheader("operation-location")
     if not op_location:
         debug_steps.append("Operation-Location header missing in analyze response.")
@@ -341,4 +340,24 @@ def _run_azure_ocr_stdlib(body_bytes: bytes, target_lang: str) -> Dict[str, Any]
             "OCR succeeded using Azure Document Intelligence REST API. "
             "Summary/translation fields will be populated once LLM is wired in."
         ),
-    ```
+        "fields": _empty_fields(),
+        "debug": {
+            "stub": False,
+            "rest": {
+                "model_id": model_id,
+                "api_version": api_version,
+                "page_count": page_count,
+                "line_count": len(lines),
+                "poll_attempts_used": attempt + 1 if length else 0,
+            },
+            "steps": debug_steps,
+        },
+    }
+
+
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    origin = req.headers.get("Origin")
+    logging.info("mailbills/parse triggered, method=%s, origin=%s", req.method, origin)
+
+    # CORS preflight
+    if req.method.upper() == "OPTIONS":
