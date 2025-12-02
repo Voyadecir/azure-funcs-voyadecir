@@ -2,7 +2,6 @@ import json
 import logging
 import os
 import time
-from typing import Dict, Any
 
 import azure.functions as func
 import urllib.request
@@ -22,7 +21,7 @@ def _cors_headers(origin):
     }
 
 
-def _json_response(payload: Dict[str, Any], origin, status_code: int = 200) -> func.HttpResponse:
+def _json_response(payload, origin, status_code=200):
     return func.HttpResponse(
         json.dumps(payload, ensure_ascii=False),
         status_code=status_code,
@@ -31,7 +30,7 @@ def _json_response(payload: Dict[str, Any], origin, status_code: int = 200) -> f
     )
 
 
-def _empty_fields() -> Dict[str, Dict[str, Any]]:
+def _empty_fields():
     # Placeholder fields until we wire proper extraction
     return {
         "amount_due": {"value": "", "confidence": 0.0},
@@ -42,23 +41,17 @@ def _empty_fields() -> Dict[str, Dict[str, Any]]:
     }
 
 
-def _http_post_bytes(url: str, headers: Dict[str, str], body: bytes, timeout: float = 30.0):
+def _http_post_bytes(url, headers, body, timeout=30.0):
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def _http_get(url: str, headers: Dict[str, str], timeout: float = 30.0):
+def _http_get(url, headers, timeout=30.0):
     req = urllib.request.Request(url, headers=headers, method="GET")
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
-    """
-    End-to-end:
-      1) POST raw file bytes to Form Recognizer v3.1 analyze endpoint
-      2) Poll Operation-Location until status == 'succeeded'
-      3) Extract text lines into a single string + snippet
-    """
+def _run_azure_ocr(body_bytes, target_lang):
     debug_steps = []
     length = len(body_bytes)
 
@@ -137,16 +130,18 @@ def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
 
     endpoint_stripped = endpoint.rstrip("/")
     analyze_url = (
-        f"{endpoint_stripped}/formrecognizer/documentModels/{model_id}:analyze"
-        f"?api-version={api_version}"
+        endpoint_stripped
+        + "/formrecognizer/documentModels/"
+        + model_id
+        + ":analyze?api-version="
+        + api_version
     )
 
-    debug_steps.append(f"Stage 0: Received {length} bytes.")
-    debug_steps.append(f"Stage 1: Calling REST API {analyze_url}")
+    debug_steps.append("Stage 0: Received %d bytes." % length)
+    debug_steps.append("Stage 1: Calling REST API %s" % analyze_url)
 
     # 1) Send analyze request with raw bytes
     headers = {
-        # Raw bytes; service will detect content type, PDF is fine here
         "Content-Type": "application/octet-stream",
         "Ocp-Apim-Subscription-Key": key,
     }
@@ -158,7 +153,7 @@ def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", "ignore")
         logging.exception("REST call to Azure Form Recognizer failed with HTTPError.")
-        debug_steps.append(f"REST call HTTPError {e.code}: {body[:500]}")
+        debug_steps.append("REST call HTTPError %d: %s" % (e.code, body[:500]))
         return {
             "ok": False,
             "message": "Azure OCR analyze request failed.",
@@ -166,7 +161,7 @@ def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
             "target_lang": target_lang,
             "ocr_text_snippet": "",
             "summary_translated": "",
-            "summary_en": f"Azure OCR analyze request failed with HTTP {e.code}.",
+            "summary_en": "Azure OCR analyze request failed with HTTP %d." % e.code,
             "fields": _empty_fields(),
             "debug": {
                 "stub": False,
@@ -175,7 +170,7 @@ def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
         }
     except Exception as e:
         logging.exception("REST call to Azure Form Recognizer failed.")
-        debug_steps.append(f"REST call to analyze endpoint failed: {str(e)}")
+        debug_steps.append("REST call to analyze endpoint failed: %s" % str(e))
         return {
             "ok": False,
             "message": "OCR failed while calling Azure OCR analyze endpoint.",
@@ -193,7 +188,7 @@ def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
 
     if status_code not in (200, 202):
         debug_steps.append(
-            f"Analyze request returned HTTP {status_code} with body: {resp_text[:500]}"
+            "Analyze request returned HTTP %d with body: %s" % (status_code, resp_text[:500])
         )
         return {
             "ok": False,
@@ -202,7 +197,7 @@ def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
             "target_lang": target_lang,
             "ocr_text_snippet": "",
             "summary_translated": "",
-            "summary_en": f"Azure OCR analyze request failed with HTTP {status_code}.",
+            "summary_en": "Azure OCR analyze request failed with HTTP %d." % status_code,
             "fields": _empty_fields(),
             "debug": {
                 "stub": False,
@@ -231,11 +226,11 @@ def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
             },
         }
 
-    debug_steps.append(f"Stage 2: Operation-Location = {op_location}")
+    debug_steps.append("Stage 2: Operation-Location = %s" % op_location)
 
     # 2) Poll for result
     status = "notStarted"
-    result_json: Dict[str, Any] | None = None
+    result_json = None
     poll_headers = {"Ocp-Apim-Subscription-Key": key}
 
     for attempt in range(poll_attempts):
@@ -248,28 +243,33 @@ def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
             body = e.read().decode("utf-8", "ignore")
             logging.exception("Polling Azure OCR result failed with HTTPError.")
             debug_steps.append(
-                f"Polling HTTPError {e.code} on attempt {attempt + 1}: {body[:500]}"
+                "Polling HTTPError %d on attempt %d: %s"
+                % (e.code, attempt + 1, body[:500])
             )
             continue
         except Exception as e:
             logging.exception("Polling Azure OCR result failed.")
-            debug_steps.append(f"Polling failed on attempt {attempt + 1}: {str(e)}")
+            debug_steps.append(
+                "Polling failed on attempt %d: %s" % (attempt + 1, str(e))
+            )
             continue
 
         if poll_status != 200:
             debug_steps.append(
-                f"Polling HTTP {poll_status} with body: {poll_text[:500]}"
+                "Polling HTTP %d with body: %s" % (poll_status, poll_text[:500])
             )
             continue
 
         try:
             result_json = json.loads(poll_text)
         except Exception as e:
-            debug_steps.append(f"Failed to parse polling JSON: {str(e)}")
+            debug_steps.append("Failed to parse polling JSON: %s" % str(e))
             continue
 
         status = result_json.get("status", "")
-        debug_steps.append(f"Stage 3 (attempt {attempt + 1}): status = {status}")
+        debug_steps.append(
+            "Stage 3 (attempt %d): status = %s" % (attempt + 1, status)
+        )
 
         if status in ("succeeded", "failed", "partiallySucceeded"):
             break
@@ -291,15 +291,15 @@ def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
         }
 
     if status != "succeeded":
-        debug_steps.append(f"Final status from Azure OCR: {status}")
+        debug_steps.append("Final status from Azure OCR: %s" % status)
         return {
             "ok": False,
-            "message": f"Azure OCR did not succeed (status={status}).",
+            "message": "Azure OCR did not succeed (status=%s)." % status,
             "received_bytes": length,
             "target_lang": target_lang,
             "ocr_text_snippet": "",
             "summary_translated": "",
-            "summary_en": f"Azure OCR did not complete successfully (status={status}).",
+            "summary_en": "Azure OCR did not complete successfully (status=%s)." % status,
             "fields": _empty_fields(),
             "debug": {
                 "stub": False,
@@ -309,7 +309,7 @@ def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
         }
 
     # 3) Extract lines of text
-    lines: list[str] = []
+    lines = []
     page_count = 0
     try:
         analyze_result = result_json.get("analyzeResult", {}) or {}
@@ -323,21 +323,8 @@ def _run_azure_ocr(body_bytes: bytes, target_lang: str) -> Dict[str, Any]:
                     lines.append(text)
     except Exception as e:
         logging.exception("Failed to parse Azure OCR analyzeResult.")
-        debug_steps.append(f"Failed to parse analyzeResult: {str(e)}")
+        debug_steps.append("Failed to parse analyzeResult: %s" % str(e))
 
     debug_steps.append(
-        f"Stage 4: Extracted {len(lines)} lines of text from {page_count} page(s)."
-    )
-
-    full_text = "\n".join(lines) if lines else ""
-    snippet = full_text[:500] if full_text else ""
-
-    return {
-        "ok": True,
-        "message": "OCR completed using Azure Form Recognizer v3.1.",
-        "received_bytes": length,
-        "target_lang": target_lang,
-        "ocr_text_snippet": snippet,
-        "summary_translated": "",
-        "summary_en": (
-            "OCR succeeded using A
+        "Stage 4: Extracted %d lines of text from %d page(s)."
+        % (len(lines), pa
