@@ -25,12 +25,10 @@ def _get_config() -> Dict[str, Any]:
     """
     Read Azure Document Intelligence settings from environment.
 
-    Supports all of these patterns:
-
-    - DOCINTEL_*                          (legacy / generic)
-    - AZURE_DOCUMENT_INTELLIGENCE_*       (older naming)
-    - AZURE_DOCINTEL_*                    (your Function App settings)
-    - AZURE_DI_*                          (your Render settings)
+    Supports:
+    - AZURE_DOCINTEL_*  (your Function App settings)
+    - AZURE_DI_*        (Render style, if you ever mirror them)
+    - Older DOCINTEL_* / AZURE_DOCUMENT_INTELLIGENCE_* names
     """
     endpoint = (
         os.environ.get("DOCINTEL_ENDPOINT")
@@ -48,14 +46,14 @@ def _get_config() -> Dict[str, Any]:
     )
     api_version = (
         os.environ.get("DOCINTEL_API_VERSION")
-        or os.environ.get("AZURE_DI_API_VERSION")
         or os.environ.get("AZURE_DOCINTEL_API_VERSION")
+        or os.environ.get("AZURE_DI_API_VERSION")
         or "2024-02-29-preview"
     )
     model_id = (
         os.environ.get("DOCINTEL_MODEL_ID")
-        or os.environ.get("AZURE_DI_MODEL")
         or os.environ.get("AZURE_DOCINTEL_MODEL_ID")
+        or os.environ.get("AZURE_DI_MODEL")
         or "prebuilt-read"
     )
 
@@ -125,7 +123,7 @@ def _analyze_document(
     debug_steps: List[str],
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """
-    Call Azure Document Intelligence /formrecognizer/documentModels/{model_id}:analyze
+    Call Azure Document Intelligence /documentintelligence/documentModels/{model_id}:analyze
     and return the operation-location URL if successful.
     """
     cfg = _get_config()
@@ -141,7 +139,8 @@ def _analyze_document(
             "message": "Azure Document Intelligence endpoint or key is not configured.",
         }
 
-    analyze_url = f"{endpoint}/formrecognizer/documentModels/{model_id}:analyze"
+    # IMPORTANT: for 2024-02-29-preview, the base path is *documentintelligence*, not *formrecognizer*
+    analyze_url = f"{endpoint}/documentintelligence/documentModels/{model_id}:analyze"
     params = {"api-version": api_version}
 
     headers = {
