@@ -94,9 +94,10 @@ def _run_azure_ocr_stdlib(body_bytes: bytes, target_lang: str) -> Dict[str, Any]
         or ""
     )
 
-    # Model + API version + polling params (with sane defaults)
+    # Use stable v3.1 API by default
+    api_version = os.getenv("AZURE_DI_API_VERSION", "2023-07-31")
     model_id = os.getenv("AZURE_DI_MODEL", "prebuilt-read")
-    api_version = os.getenv("AZURE_DI_API_VERSION", "2024-02-29-preview")
+
     try:
         poll_attempts = int(os.getenv("AZURE_DI_POLL_ATTEMPTS", "10"))
     except ValueError:
@@ -131,9 +132,10 @@ def _run_azure_ocr_stdlib(body_bytes: bytes, target_lang: str) -> Dict[str, Any]
         }
 
     endpoint = endpoint.rstrip("/")
-    # IMPORTANT: correct URL – no _overload param
+
+    # IMPORTANT: use formrecognizer path for v3.1 (2023-07-31)
     analyze_url = (
-        f"{endpoint}/documentintelligence/documentModels/{model_id}:analyze"
+        f"{endpoint}/formrecognizer/documentModels/{model_id}:analyze"
         f"?api-version={api_version}"
     )
 
@@ -208,7 +210,7 @@ def _run_azure_ocr_stdlib(body_bytes: bytes, target_lang: str) -> Dict[str, Any]
             },
         }
 
-    # Operation-Location header is not directly exposed by urllib, so we need to re-call headers from resp
+    # Operation-Location header
     op_location = resp.getheader("Operation-Location") or resp.getheader("operation-location")
     if not op_location:
         debug_steps.append("Operation-Location header missing in analyze response.")
@@ -339,69 +341,4 @@ def _run_azure_ocr_stdlib(body_bytes: bytes, target_lang: str) -> Dict[str, Any]
             "OCR succeeded using Azure Document Intelligence REST API. "
             "Summary/translation fields will be populated once LLM is wired in."
         ),
-        "fields": _empty_fields(),
-        "debug": {
-            "stub": False,
-            "rest": {
-                "model_id": model_id,
-                "api_version": api_version,
-                "page_count": page_count,
-                "line_count": len(lines),
-                "poll_attempts_used": attempt + 1 if length else 0,
-            },
-            "steps": debug_steps,
-        },
-    }
-
-
-def main(req: func.HttpRequest) -> func.HttpResponse:
-    origin = req.headers.get("Origin")
-    logging.info("mailbills/parse triggered, method=%s, origin=%s", req.method, origin)
-
-    # CORS preflight
-    if req.method.upper() == "OPTIONS":
-        return func.HttpResponse("", status_code=204, headers=_cors_headers(origin))
-
-    # Only POST is supported (but keep HTTP 200 so the frontend doesn't explode)
-    if req.method.upper() != "POST":
-        payload = {
-            "ok": False,
-            "message": "Use POST with PDF or image bytes.",
-        }
-        return _json_response(payload, origin, status_code=200)
-
-    try:
-        # Read body bytes
-        try:
-            body_bytes = req.get_body() or b""
-        except Exception as e:
-            logging.exception("Failed to read request body")
-            payload = {
-                "ok": False,
-                "message": "Could not read request body.",
-                "error": str(e),
-                "fields": _empty_fields(),
-            }
-            return _json_response(payload, origin, status_code=200)
-
-        target_lang = (req.params.get("target_lang") or "en").strip().lower() or "en"
-
-        logging.info(
-            "mailbills/parse received %d bytes, target_lang=%s",
-            len(body_bytes),
-            target_lang,
-        )
-
-        payload = _run_azure_ocr_stdlib(body_bytes, target_lang)
-        return _json_response(payload, origin, status_code=200)
-
-    except Exception as e:
-        # Catch any unhandled error so we DO NOT 500 with empty body
-        logging.exception("Unhandled error in mailbills/parse.")
-        payload = {
-            "ok": False,
-            "message": "Unhandled server error in mailbills/parse.",
-            "error": str(e),
-            "fields": _empty_fields(),
-        }
-        return _json_response(payload, origin, status_code=200)
+    ```
