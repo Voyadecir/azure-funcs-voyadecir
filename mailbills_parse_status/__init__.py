@@ -1,69 +1,106 @@
-import azure.functions as func
-import json
 import os
+import json
+import time
+import requests
+import azure.functions as func
 from azure.storage.blob import BlobServiceClient
-from azure.ai.formrecognizer import DocumentAnalysisClient
-from azure.core.credentials import AzureKeyCredential
+
+CONTAINER = "mailbills"
+
+def _container():
+    cs = os.environ["AzureWebJobsStorage"]
+    bs = BlobServiceClient.from_connection_string(cs)
+    return bs.get_container_client(CONTAINER)
+
+def _extract_text(di: dict) -> str:
+    # Best-effort across DI response shapes
+    content = di.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+
+    ar = di.get("analyzeResult") or {}
+    content2 = ar.get("content")
+    if isinstance(content2, str) and content2.strip():
+        return content2
+
+    pages = ar.get("pages") or []
+    lines = []
+    for p in pages:
+        for ln in (p.get("lines") or []):
+            c = ln.get("content")
+            if c:
+                lines.append(c)
+    return "\n".join(lines)
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    job_id = req.params.get("job_id")
-    if not job_id:
-        return func.HttpResponse(
-            "Missing job_id",
-            status_code=400
-        )
+    try:
+        job_id = (req.params.get("job_id") or "").strip()
+        if not job_id:
+            return func.HttpResponse(
+                json.dumps({"error": "Missing job_id"}),
+                status_code=400,
+                mimetype="application/json",
+            )
 
-    blob_service = BlobServiceClient.from_connection_string(
-        os.environ["AzureWebJobsStorage"]
-    )
-    container = blob_service.get_container_client("mailbills")
+        cont = _container()
+        job_blob = cont.get_blob_client(f"jobs/{job_id}.json")
+        job = json.loads(job_blob.download_blob().readall())
 
-    job_blob = container.get_blob_client(f"jobs/{job_id}.json")
-    job_data = json.loads(job_blob.download_blob().readall())
+        if job.get("status") == "done":
+            text = cont.get_blob_client(f"results/{job_id}.txt").download_blob().readall().decode("utf-8")
+            return func.HttpResponse(
+                json.dumps({"status": "done", "text": text}),
+                status_code=200,
+                mimetype="application/json",
+            )
 
-    if job_data["status"] == "done":
-        text_blob = container.get_blob_client(f"results/{job_id}.txt")
-        text = text_blob.download_blob().readall().decode("utf-8")
+        op_url = job.get("op_url")
+        if not op_url:
+            return func.HttpResponse(
+                json.dumps({"status": "failed", "error": "Missing op_url"}),
+                status_code=200,
+                mimetype="application/json",
+            )
+
+        key = os.environ["AZURE_DOCINTEL_KEY"]
+        r = requests.get(op_url, headers={"Ocp-Apim-Subscription-Key": key}, timeout=30)
+
+        if r.status_code != 200:
+            return func.HttpResponse(
+                json.dumps({"status": "running", "note": f"DI returned {r.status_code}"}),
+                status_code=200,
+                mimetype="application/json",
+            )
+
+        di = r.json()
+        st = (di.get("status") or "").lower()
+
+        if st in ("notstarted", "running"):
+            return func.HttpResponse(json.dumps({"status": "running"}), status_code=200, mimetype="application/json")
+
+        if st == "failed":
+            job["status"] = "failed"
+            job["error"] = di.get("error") or di
+            job_blob.upload_blob(json.dumps(job), overwrite=True)
+            return func.HttpResponse(json.dumps({"status": "failed"}), status_code=200, mimetype="application/json")
+
+        # succeeded
+        text = _extract_text(di) or ""
+        cont.upload_blob(f"results/{job_id}.txt", text, overwrite=True)
+
+        job["status"] = "done"
+        job["finished_at"] = int(time.time())
+        job_blob.upload_blob(json.dumps(job), overwrite=True)
+
         return func.HttpResponse(
             json.dumps({"status": "done", "text": text}),
-            mimetype="application/json"
+            status_code=200,
+            mimetype="application/json",
         )
 
-    # Reconnect to OCR poller
-    client = DocumentAnalysisClient(
-        endpoint=os.environ["AZURE_DOCINTEL_ENDPOINT"],
-        credential=AzureKeyCredential(os.environ["AZURE_DOCINTEL_KEY"])
-    )
-
-    poller = client.begin_analyze_document_from_url(
-        "prebuilt-read",
-        job_data["poller_url"]
-    )
-
-    if poller.done():
-        result = poller.result()
-        text = "\n".join(
-            line.content
-            for page in result.pages
-            for line in page.lines
-        )
-
-        container.upload_blob(
-            name=f"results/{job_id}.txt",
-            data=text,
-            overwrite=True
-        )
-
-        job_data["status"] = "done"
-        job_blob.upload_blob(json.dumps(job_data), overwrite=True)
-
+    except Exception as e:
         return func.HttpResponse(
-            json.dumps({"status": "done", "text": text}),
-            mimetype="application/json"
+            json.dumps({"error": "mailbills_parse_status crashed", "detail": str(e)}),
+            status_code=500,
+            mimetype="application/json",
         )
-
-    return func.HttpResponse(
-        json.dumps({"status": "running"}),
-        mimetype="application/json"
-    )
-
