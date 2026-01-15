@@ -47,22 +47,39 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         endpoint = os.environ["AZURE_DOCINTEL_ENDPOINT"].rstrip("/")
         key = os.environ["AZURE_DOCINTEL_KEY"]
 
-        # Start DI async job using URL source (no big PDF bytes through Functions)
-        url = f"{endpoint}/documentintelligence/documentModels/{DI_MODEL}:analyze?api-version={DI_API_VERSION}"
         headers = {
             "Ocp-Apim-Subscription-Key": key,
             "Content-Type": "application/json",
         }
         payload = {"urlSource": blob_url}
 
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        # Try both route styles because some resources only support one.
+        candidate_urls = [
+            f"{endpoint}/documentintelligence/documentModels/{DI_MODEL}:analyze?api-version={DI_API_VERSION}",
+            f"{endpoint}/formrecognizer/documentModels/{DI_MODEL}:analyze?api-version={DI_API_VERSION}",
+        ]
 
-        if r.status_code != 202:
+        r = None
+        last_status = None
+        last_text = ""
+
+        used_url = None
+        for u in candidate_urls:
+            resp = requests.post(u, headers=headers, json=payload, timeout=30)
+            last_status = resp.status_code
+            last_text = (resp.text or "")[:1500]
+            if resp.status_code == 202:
+                r = resp
+                used_url = u
+                break
+
+        if r is None:
             return func.HttpResponse(
                 json.dumps({
                     "error": "Document Intelligence start failed",
-                    "status": r.status_code,
-                    "detail": (r.text or "")[:1500],
+                    "status": last_status,
+                    "detail": last_text,
+                    "tried": candidate_urls,
                 }),
                 status_code=502,
                 mimetype="application/json",
@@ -71,7 +88,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         op_url = r.headers.get("operation-location") or r.headers.get("Operation-Location")
         if not op_url:
             return func.HttpResponse(
-                json.dumps({"error": "Missing Operation-Location from Document Intelligence"}),
+                json.dumps({
+                    "error": "Missing Operation-Location from Document Intelligence",
+                    "used_url": used_url,
+                }),
                 status_code=502,
                 mimetype="application/json",
             )
@@ -88,7 +108,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "status": "running",
             "op_url": op_url,
             "created_at": int(time.time()),
-            "blob_url": blob_url
+            "blob_url": blob_url,
+            "di_start_url": used_url,
         }
 
         cont.upload_blob(f"jobs/{job_id}.json", json.dumps(job_record), overwrite=True)
