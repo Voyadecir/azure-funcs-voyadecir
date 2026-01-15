@@ -18,8 +18,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     """
     Expected JSON body:
       { "job_id": "...", "blob_url": "https://...SAS..." }
-
-    Note: blob_url SHOULD include SAS so Document Intelligence can fetch it.
     """
     try:
         try:
@@ -53,17 +51,19 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         }
         payload = {"urlSource": blob_url}
 
-        # Try both route styles because some resources only support one.
+        # Try both base routes + both analyze styles (:analyze and /analyze)
         candidate_urls = [
             f"{endpoint}/documentintelligence/documentModels/{DI_MODEL}:analyze?api-version={DI_API_VERSION}",
+            f"{endpoint}/documentintelligence/documentModels/{DI_MODEL}/analyze?api-version={DI_API_VERSION}",
             f"{endpoint}/formrecognizer/documentModels/{DI_MODEL}:analyze?api-version={DI_API_VERSION}",
+            f"{endpoint}/formrecognizer/documentModels/{DI_MODEL}/analyze?api-version={DI_API_VERSION}",
         ]
 
         r = None
         last_status = None
         last_text = ""
-
         used_url = None
+
         for u in candidate_urls:
             resp = requests.post(u, headers=headers, json=payload, timeout=30)
             last_status = resp.status_code
@@ -79,7 +79,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     "error": "Document Intelligence start failed",
                     "status": last_status,
                     "detail": last_text,
-                    "tried": candidate_urls,
+                    "tried": candidate_urls
                 }),
                 status_code=502,
                 mimetype="application/json",
@@ -88,10 +88,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         op_url = r.headers.get("operation-location") or r.headers.get("Operation-Location")
         if not op_url:
             return func.HttpResponse(
-                json.dumps({
-                    "error": "Missing Operation-Location from Document Intelligence",
-                    "used_url": used_url,
-                }),
+                json.dumps({"error": "Missing Operation-Location from Document Intelligence", "used_url": used_url}),
                 status_code=502,
                 mimetype="application/json",
             )
@@ -102,7 +99,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         except Exception:
             pass
 
-        # Save job record (status endpoint uses this)
         job_record = {
             "job_id": job_id,
             "status": "running",
