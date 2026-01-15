@@ -1,6 +1,5 @@
 import os
 import json
-import uuid
 import time
 import requests
 import azure.functions as func
@@ -16,33 +15,47 @@ def _container():
     return bs.get_container_client(CONTAINER)
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Expected JSON body:
+      { "job_id": "...", "blob_url": "https://...SAS..." }
+
+    Note: blob_url SHOULD include SAS so Document Intelligence can fetch it.
+    """
     try:
-        job_id = str(uuid.uuid4())
-        data = req.get_body()
-        if not data:
+        try:
+            body = req.get_json()
+        except Exception:
+            body = None
+
+        if not isinstance(body, dict):
             return func.HttpResponse(
-                json.dumps({"error": "No file uploaded"}),
+                json.dumps({"error": "Expected JSON body: { job_id, blob_url }"}),
                 status_code=400,
                 mimetype="application/json",
             )
 
-        ct = req.headers.get("content-type", "application/octet-stream")
+        job_id = str(body.get("job_id") or "").strip()
+        blob_url = str(body.get("blob_url") or "").strip()
 
-        # Save upload for debugging / retry (optional but helpful)
-        cont = _container()
-        cont.upload_blob(f"uploads/{job_id}.bin", data, overwrite=True)
+        if not job_id or not blob_url:
+            return func.HttpResponse(
+                json.dumps({"error": "Missing job_id or blob_url"}),
+                status_code=400,
+                mimetype="application/json",
+            )
 
         endpoint = os.environ["AZURE_DOCINTEL_ENDPOINT"].rstrip("/")
         key = os.environ["AZURE_DOCINTEL_KEY"]
 
-        # Start DI async job
+        # Start DI async job using URL source (no big PDF bytes through Functions)
         url = f"{endpoint}/documentintelligence/documentModels/{DI_MODEL}:analyze?api-version={DI_API_VERSION}"
         headers = {
             "Ocp-Apim-Subscription-Key": key,
-            "Content-Type": ct,
+            "Content-Type": "application/json",
         }
+        payload = {"urlSource": blob_url}
 
-        r = requests.post(url, headers=headers, data=data, timeout=30)
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
 
         if r.status_code != 202:
             return func.HttpResponse(
@@ -63,11 +76,19 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json",
             )
 
+        cont = _container()
+        try:
+            cont.create_container()
+        except Exception:
+            pass
+
+        # Save job record (status endpoint uses this)
         job_record = {
             "job_id": job_id,
             "status": "running",
             "op_url": op_url,
             "created_at": int(time.time()),
+            "blob_url": blob_url
         }
 
         cont.upload_blob(f"jobs/{job_id}.json", json.dumps(job_record), overwrite=True)
