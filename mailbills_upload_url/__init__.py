@@ -9,9 +9,8 @@ from azure.storage.blob import generate_blob_sas, BlobSasPermissions
 
 CONTAINER = "mailbills"
 
-def _get_account_key_from_conn_string(cs: str) -> str | None:
-    # AzureWebJobsStorage is a connection string like:
-    # DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net
+def _get_account_key_from_conn_string(cs):
+    # Works on older Python versions (no 3.10+ type syntax).
     for part in cs.split(";"):
         if part.startswith("AccountKey="):
             return part.split("=", 1)[1]
@@ -33,17 +32,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         filename = str(body.get("filename") or "upload.pdf")
         content_type = str(body.get("content_type") or "application/octet-stream")
 
-        # Job id becomes the stable handle used throughout the flow
         job_id = str(uuid.uuid4())
 
-        # Make a safe blob path: uploads/<job_id>/<filename>
         safe_name = filename.replace("/", "_").replace("\\", "_").strip() or "upload.pdf"
-        blob_name = f"uploads/{job_id}/{safe_name}"
+        blob_name = "uploads/{}/{}".format(job_id, safe_name)
 
         cs = os.environ["AzureWebJobsStorage"]
         blob_service = BlobServiceClient.from_connection_string(cs)
 
-        # Ensure container exists
         container = blob_service.get_container_client(CONTAINER)
         try:
             container.create_container()
@@ -59,7 +55,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json",
             )
 
-        # Short-lived SAS token (10 minutes)
         expiry = datetime.datetime.utcnow() + datetime.timedelta(minutes=10)
 
         sas = generate_blob_sas(
@@ -71,8 +66,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             expiry=expiry,
         )
 
-        blob_url = f"https://{account_name}.blob.core.windows.net/{CONTAINER}/{blob_name}"
-        upload_url = f"{blob_url}?{sas}"
+        blob_url = "https://{}.blob.core.windows.net/{}/{}".format(account_name, CONTAINER, blob_name)
+        upload_url = "{}?{}".format(blob_url, sas)
 
         return func.HttpResponse(
             json.dumps({
@@ -87,6 +82,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
+        # IMPORTANT: return JSON so we don't get silent 500s once it's running
         return func.HttpResponse(
             json.dumps({"error": "mailbills_upload_url crashed", "detail": str(e)}),
             status_code=500,
