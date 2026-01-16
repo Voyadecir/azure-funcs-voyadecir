@@ -8,6 +8,7 @@ from azure.storage.blob import (
     BlobServiceClient,
     generate_blob_sas,
     BlobSasPermissions,
+    ContentSettings,
 )
 
 CONTAINER = "mailbills"
@@ -43,14 +44,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
         blob = container.get_blob_client(blob_name)
 
-        # Upload first
+        # Create the blob placeholder (content uploaded later via PUT)
         blob.upload_blob(
             b"",
             overwrite=True,
-            content_settings={"content_type": content_type},
+            content_settings=ContentSettings(content_type=content_type),
         )
 
-        # Generate SAS AFTER upload
+        # Generate SAS AFTER blob exists
         expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=2)
 
         sas = generate_blob_sas(
@@ -62,7 +63,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             expiry=expiry,
         )
 
-        blob_url = f"https://{account_name}.blob.core.windows.net/{CONTAINER}/{blob_name}?{sas}"
+        blob_url = (
+            f"https://{account_name}.blob.core.windows.net/"
+            f"{CONTAINER}/{blob_name}?{sas}"
+        )
 
         return func.HttpResponse(
             json.dumps({
