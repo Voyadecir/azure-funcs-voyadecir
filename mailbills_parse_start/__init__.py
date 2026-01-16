@@ -3,11 +3,18 @@ import io
 import json
 import time
 import math
+from datetime import datetime, timedelta
+
 import requests
 import azure.functions as func
-from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.storage.blob import (
+    BlobServiceClient,
+    ContentSettings,
+    BlobSasPermissions,
+    generate_blob_sas,
+)
 
-from pypdf import PdfReader, PdfWriter  # <-- requires `pypdf` in requirements.txt
+from pypdf import PdfReader, PdfWriter  # requires `pypdf` in requirements.txt
 
 
 CONTAINER = "mailbills"
@@ -15,14 +22,12 @@ CONTAINER = "mailbills"
 DI_API_VERSION = os.environ.get("AZURE_DI_API_VERSION", "").strip() or "2023-07-31"
 DI_MODEL = os.environ.get("AZURE_DI_MODEL", "").strip() or "prebuilt-read"
 
-# Pages per chunk (keep small to avoid DI size limits)
 SPLIT_PAGES = int(os.environ.get("OCR_SPLIT_PAGES", "5"))
-
-# Safety cap: max chunks to prevent someone uploading a 900-page PDF and nuking your budget
 MAX_CHUNKS = int(os.environ.get("OCR_MAX_CHUNKS", "50"))
-
-# HTTP timeouts
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT_SECONDS", "30"))
+
+# READ SAS validity for split parts (must outlive DI kickoff)
+PART_SAS_TTL_MINUTES = int(os.environ.get("OCR_PART_SAS_TTL_MINUTES", "90"))
 
 
 def _json(status_code: int, payload: dict) -> func.HttpResponse:
@@ -39,41 +44,63 @@ def _container():
     return bs.get_container_client(CONTAINER)
 
 
+def _parse_conn_string(cs: str) -> dict:
+    """Parse an Azure Storage connection string safely (AccountKey contains '=')."""
+    out = {}
+    for chunk in (cs or "").split(";"):
+        if not chunk or "=" not in chunk:
+            continue
+        k, v = chunk.split("=", 1)
+        out[k] = v
+    return out
+
+
+def _blob_read_sas_url(container_client, blob_name: str) -> str:
+    """Generate a blob-level READ SAS URL for a blob in our storage account."""
+    cs = os.environ["AzureWebJobsStorage"]
+    parts = _parse_conn_string(cs)
+    account_name = parts.get("AccountName")
+    account_key = parts.get("AccountKey")
+    if not account_name or not account_key:
+        raise RuntimeError("AzureWebJobsStorage missing AccountName or AccountKey")
+
+    expiry = datetime.utcnow() + timedelta(minutes=PART_SAS_TTL_MINUTES)
+
+    sas = generate_blob_sas(
+        account_name=account_name,
+        account_key=account_key,
+        container_name=container_client.container_name,
+        blob_name=blob_name,
+        permission=BlobSasPermissions(read=True),
+        expiry=expiry,
+    )
+
+    blob_client = container_client.get_blob_client(blob_name)
+    return f"{blob_client.url}?{sas}"
+
+
 def _download_bytes_from_sas(url: str) -> bytes:
-    # Using SAS URL provided by your upload flow
     r = requests.get(url, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.content
 
 
 def _upload_bytes(cont, blob_name: str, data: bytes, content_type: str = "application/pdf") -> str:
-    # Upload chunk PDF to your container
     cont.upload_blob(
         blob_name,
         data,
         overwrite=True,
         content_settings=ContentSettings(content_type=content_type),
     )
-    # Return *non-SAS* URL for recordkeeping (DI will use SAS generated below)
     return cont.get_blob_client(blob_name).url
 
 
-def _make_sas_like_url(original_sas_url: str, new_blob_url: str) -> str:
-    """
-    Reuse the SAS query string from the original upload URL.
-    This works because your upload SAS is usually scoped to the container and allows read.
-    If your SAS is blob-scoped, this won't work and you'll need to generate SAS server-side.
-    """
-    if "?" not in original_sas_url:
-        return new_blob_url
-    qs = original_sas_url.split("?", 1)[1]
-    return f"{new_blob_url}?{qs}"
+def _is_pdf_bytes(data: bytes) -> bool:
+    return len(data) >= 4 and data[:4] == b"%PDF"
 
 
 def _build_candidate_di_urls(endpoint: str, api_version: str, model: str) -> list[str]:
     endpoint = endpoint.rstrip("/")
-    # Use only :analyze shape (most consistent for documentModels)
-    # Try documentintelligence first, then formrecognizer
     return [
         f"{endpoint}/documentintelligence/documentModels/{model}:analyze?api-version={api_version}",
         f"{endpoint}/formrecognizer/documentModels/{model}:analyze?api-version={api_version}",
@@ -81,9 +108,6 @@ def _build_candidate_di_urls(endpoint: str, api_version: str, model: str) -> lis
 
 
 def _start_di_analyze(di_urls: list[str], key: str, sas_url: str) -> tuple[str, str]:
-    """
-    Returns (operation_location, used_di_url)
-    """
     headers = {
         "Ocp-Apim-Subscription-Key": key,
         "Content-Type": "application/json",
@@ -143,11 +167,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         if not job_id or not blob_url:
             return _json(400, {"error": "Missing job_id or blob_url"})
 
-        # DI config
         endpoint = os.environ["AZURE_DOCINTEL_ENDPOINT"].rstrip("/")
         key = os.environ["AZURE_DOCINTEL_KEY"]
 
-        # Download the original PDF/image bytes from SAS
+        # 1) Download original bytes from READ SAS URL (works for your uploads blob)
         data = _download_bytes_from_sas(blob_url)
 
         cont = _container()
@@ -156,20 +179,17 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         except Exception:
             pass
 
-        # Detect PDF vs image by magic header
-        is_pdf = len(data) >= 4 and data[:4] == b"%PDF"
+        is_pdf = _is_pdf_bytes(data)
 
-        # If not PDF, we skip splitting and just do one op_url
         part_blob_names: list[str] = []
         part_sas_urls: list[str] = []
 
+        # 2) Write parts to blob + generate per-part READ SAS URLs
         if not is_pdf:
-            # Store a copy as a "part" for consistency
             part_name = f"parts/{job_id}/part_001.bin"
-            part_url = _upload_bytes(cont, part_name, data, content_type="application/octet-stream")
-            part_sas = _make_sas_like_url(blob_url, part_url)
+            _upload_bytes(cont, part_name, data, content_type="application/octet-stream")
+            part_sas_urls.append(_blob_read_sas_url(cont, part_name))
             part_blob_names.append(part_name)
-            part_sas_urls.append(part_sas)
         else:
             chunks = _split_pdf_into_chunks(data, SPLIT_PAGES)
             if not chunks:
@@ -185,41 +205,35 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     },
                 )
 
-            # Upload each chunk as its own PDF blob + SAS URL
             digits = int(math.log10(len(chunks))) + 1 if len(chunks) > 0 else 3
             for idx, chunk_bytes in enumerate(chunks, start=1):
                 part_name = f"parts/{job_id}/part_{idx:0{digits}d}.pdf"
-                part_url = _upload_bytes(cont, part_name, chunk_bytes, content_type="application/pdf")
-                part_sas = _make_sas_like_url(blob_url, part_url)
+                _upload_bytes(cont, part_name, chunk_bytes, content_type="application/pdf")
+                part_sas_urls.append(_blob_read_sas_url(cont, part_name))
                 part_blob_names.append(part_name)
-                part_sas_urls.append(part_sas)
 
-        # Start DI for each part
+        # 3) Start DI for each part using that part’s own READ SAS URL
         di_urls = _build_candidate_di_urls(endpoint, DI_API_VERSION, DI_MODEL)
 
         op_urls: list[str] = []
         used_di_urls: list[str] = []
-
         for sas_part_url in part_sas_urls:
             op_url, used_url = _start_di_analyze(di_urls, key, sas_part_url)
             op_urls.append(op_url)
             used_di_urls.append(used_url)
 
-        # Persist job record
+        # 4) Persist job
         job_record = {
             "job_id": job_id,
             "status": "running",
             "created_at": int(time.time()),
             "blob_url": blob_url,
-
-            # Splitting info
             "split": {
                 "is_pdf": bool(is_pdf),
                 "pages_per_chunk": SPLIT_PAGES if is_pdf else None,
                 "parts": part_blob_names,
+                "parts_read_urls": part_sas_urls,
             },
-
-            # DI info
             "di": {
                 "api_version": DI_API_VERSION,
                 "model": DI_MODEL,
@@ -230,11 +244,9 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         }
 
         cont.upload_blob(f"jobs/{job_id}.json", json.dumps(job_record), overwrite=True)
-
         return _json(200, {"job_id": job_id})
 
     except requests.HTTPError as e:
-        # If DI or blob download returns a structured error, surface it cleanly
         return _json(502, {"error": "HTTP error during parse_start", "detail": str(e)})
     except Exception as e:
         return _json(500, {"error": "mailbills_parse_start crashed", "detail": str(e)})
