@@ -1,7 +1,7 @@
 import os
 import json
 import uuid
-import time
+from datetime import datetime, timedelta
 import azure.functions as func
 from azure.storage.blob import (
     BlobServiceClient,
@@ -30,13 +30,15 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         blob_name = f"uploads/{job_id}"
         blob_client = cont.get_blob_client(blob_name)
 
+        expiry = datetime.utcnow() + timedelta(seconds=UPLOAD_TTL_SECONDS)
+
         sas = generate_blob_sas(
             account_name=blob_client.account_name,
             container_name=cont.container_name,
             blob_name=blob_name,
             account_key=os.environ["AzureWebJobsStorage"].split("AccountKey=")[1].split(";")[0],
             permission=BlobSasPermissions(write=True, create=True),
-            expiry=int(time.time()) + UPLOAD_TTL_SECONDS,
+            expiry=expiry,
         )
 
         upload_url = f"{blob_client.url}?{sas}"
