@@ -4,100 +4,83 @@ import uuid
 import datetime
 import azure.functions as func
 
-from azure.storage.blob import BlobServiceClient
-from azure.storage.blob import generate_blob_sas, BlobSasPermissions
+from azure.storage.blob import (
+    BlobServiceClient,
+    generate_blob_sas,
+    BlobSasPermissions,
+)
 
 CONTAINER = "mailbills"
 
+
 def _get_conn_string_value(cs, key_name):
-    # Parses connection string pairs like "AccountName=...;AccountKey=...;"
     for part in cs.split(";"):
         if part.startswith(key_name + "="):
             return part.split("=", 1)[1]
-    return None
+    raise RuntimeError(f"Missing {key_name} in AzureWebJobsStorage")
+
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Returns a short-lived SAS URL the browser can PUT to (direct-to-Blob upload).
-
-    Response JSON (exact keys the website expects):
-      {
-        "job_id": "...",
-        "blob_url": "https://<acct>.blob.core.windows.net/mailbills/uploads/<job_id>/<filename>",
-        "upload_url": "blob_url?<sas>",
-        "expires_utc": "..."
-      }
-    """
     try:
-        # Read JSON input (filename/content_type)
-        body = {}
-        try:
-            body = req.get_json() or {}
-        except Exception:
-            body = {}
+        body = req.get_json()
+        filename = body.get("filename") or "document"
+        content_type = body.get("content_type") or "application/octet-stream"
 
-        filename = str(body.get("filename") or "upload.pdf")
-        content_type = str(body.get("content_type") or "application/octet-stream")
+        ext = os.path.splitext(filename)[1] or ".bin"
+        blob_name = f"{uuid.uuid4().hex}{ext}"
 
-        # Generate job_id used throughout the pipeline
-        job_id = str(uuid.uuid4())
+        conn_str = os.environ["AzureWebJobsStorage"]
+        account_name = _get_conn_string_value(conn_str, "AccountName")
+        account_key = _get_conn_string_value(conn_str, "AccountKey")
 
-        # Safe blob name: uploads/<job_id>/<filename>
-        safe_name = filename.replace("/", "_").replace("\\", "_").strip() or "upload.pdf"
-        blob_name = "uploads/{}/{}".format(job_id, safe_name)
+        service = BlobServiceClient.from_connection_string(conn_str)
+        container = service.get_container_client(CONTAINER)
 
-        # Use the same storage account your Function App already uses
-        cs = os.environ["AzureWebJobsStorage"]
-        account_name = _get_conn_string_value(cs, "AccountName")
-        account_key = _get_conn_string_value(cs, "AccountKey")
-
-        if not account_name or not account_key:
-            return func.HttpResponse(
-                json.dumps({"error": "AzureWebJobsStorage missing AccountName/AccountKey"}),
-                status_code=500,
-                mimetype="application/json",
-            )
-
-        # Ensure container exists
-        blob_service = BlobServiceClient.from_connection_string(cs)
-        container = blob_service.get_container_client(CONTAINER)
         try:
             container.create_container()
         except Exception:
-            pass
+            pass  # already exists
 
-        # Create SAS for PUT upload (write/create) + optional read
-        expiry = datetime.datetime.utcnow() + datetime.timedelta(minutes=10)
+        blob = container.get_blob_client(blob_name)
+
+        # Upload first
+        blob.upload_blob(
+            b"",
+            overwrite=True,
+            content_settings={"content_type": content_type},
+        )
+
+        # Generate SAS AFTER upload
+        expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=2)
 
         sas = generate_blob_sas(
             account_name=account_name,
             container_name=CONTAINER,
             blob_name=blob_name,
             account_key=account_key,
-            permission=BlobSasPermissions(read=True, create=True, write=True),
+            permission=BlobSasPermissions(read=True, write=True),
             expiry=expiry,
         )
 
-        blob_url = "https://{}.blob.core.windows.net/{}/{}".format(account_name, CONTAINER, blob_name)
-        upload_url = "{}?{}".format(blob_url, sas)
+        blob_url = f"https://{account_name}.blob.core.windows.net/{CONTAINER}/{blob_name}?{sas}"
 
-        # Return EXACT keys expected by your frontend
         return func.HttpResponse(
             json.dumps({
-                "job_id": job_id,
                 "blob_url": blob_url,
-                "upload_url": upload_url,
+                "blob_name": blob_name,
                 "expires_utc": expiry.isoformat() + "Z",
-                "content_type": content_type
+                "content_type": content_type,
             }),
             status_code=200,
             mimetype="application/json",
         )
 
     except Exception as e:
-        # Return JSON so failures are visible (no silent empty 500)
         return func.HttpResponse(
-            json.dumps({"error": "mailbills_upload_url crashed", "detail": str(e)}),
+            json.dumps({
+                "error": "mailbills_upload_url crashed",
+                "detail": str(e),
+            }),
             status_code=500,
             mimetype="application/json",
         )
