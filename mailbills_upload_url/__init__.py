@@ -1,79 +1,52 @@
 import os
 import json
 import uuid
-import datetime
+import time
 import azure.functions as func
-
 from azure.storage.blob import (
     BlobServiceClient,
-    generate_blob_sas,
     BlobSasPermissions,
-    ContentSettings,
+    generate_blob_sas,
 )
 
 CONTAINER = "mailbills"
+UPLOAD_TTL_SECONDS = 15 * 60  # 15 minutes
 
-
-def _get_conn_string_value(cs, key_name):
-    for part in cs.split(";"):
-        if part.startswith(key_name + "="):
-            return part.split("=", 1)[1]
-    raise RuntimeError(f"Missing {key_name} in AzureWebJobsStorage")
-
+def _container():
+    cs = os.environ["AzureWebJobsStorage"]
+    bs = BlobServiceClient.from_connection_string(cs)
+    return bs.get_container_client(CONTAINER)
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        body = req.get_json()
-        filename = body.get("filename") or "document"
-        content_type = body.get("content_type") or "application/octet-stream"
+        job_id = str(uuid.uuid4())
 
-        ext = os.path.splitext(filename)[1] or ".bin"
-        blob_name = f"{uuid.uuid4().hex}{ext}"
-
-        conn_str = os.environ["AzureWebJobsStorage"]
-        account_name = _get_conn_string_value(conn_str, "AccountName")
-        account_key = _get_conn_string_value(conn_str, "AccountKey")
-
-        service = BlobServiceClient.from_connection_string(conn_str)
-        container = service.get_container_client(CONTAINER)
-
+        cont = _container()
         try:
-            container.create_container()
+            cont.create_container()
         except Exception:
-            pass  # already exists
+            pass
 
-        blob = container.get_blob_client(blob_name)
-
-        # Create the blob placeholder (content uploaded later via PUT)
-        blob.upload_blob(
-            b"",
-            overwrite=True,
-            content_settings=ContentSettings(content_type=content_type),
-        )
-
-        # Generate SAS AFTER blob exists
-        expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=2)
+        blob_name = f"uploads/{job_id}"
+        blob_client = cont.get_blob_client(blob_name)
 
         sas = generate_blob_sas(
-            account_name=account_name,
-            container_name=CONTAINER,
+            account_name=blob_client.account_name,
+            container_name=cont.container_name,
             blob_name=blob_name,
-            account_key=account_key,
-            permission=BlobSasPermissions(read=True, write=True),
-            expiry=expiry,
+            account_key=os.environ["AzureWebJobsStorage"].split("AccountKey=")[1].split(";")[0],
+            permission=BlobSasPermissions(write=True, create=True),
+            expiry=int(time.time()) + UPLOAD_TTL_SECONDS,
         )
 
-        blob_url = (
-            f"https://{account_name}.blob.core.windows.net/"
-            f"{CONTAINER}/{blob_name}?{sas}"
-        )
+        upload_url = f"{blob_client.url}?{sas}"
+        blob_url = blob_client.url
 
         return func.HttpResponse(
             json.dumps({
+                "job_id": job_id,
+                "upload_url": upload_url,
                 "blob_url": blob_url,
-                "blob_name": blob_name,
-                "expires_utc": expiry.isoformat() + "Z",
-                "content_type": content_type,
             }),
             status_code=200,
             mimetype="application/json",
