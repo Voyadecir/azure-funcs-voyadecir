@@ -2,3 +2,4 @@ azure-functions
 requests>=2.31.0
 azure-storage-blob>=12.19.0
 cryptography==43.0.3
+pypdf
