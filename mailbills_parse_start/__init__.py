@@ -16,9 +16,21 @@ def _container():
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Expected JSON body:
-      { "job_id": "...", "blob_url": "https://...SAS..." }
+    TEMPORARY DIAGNOSTIC RETURN
+    This proves whether Azure can return JSON correctly.
     """
+
+    # 🔴 TEMPORARY EARLY RETURN — DO NOT REMOVE YET
+    return func.HttpResponse(
+        json.dumps({"ok": True}),
+        status_code=200,
+        mimetype="application/json",
+    )
+
+    # ================================
+    # EVERYTHING BELOW IS CURRENTLY BYPASSED
+    # ================================
+
     try:
         try:
             body = req.get_json()
@@ -51,7 +63,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         }
         payload = {"urlSource": blob_url}
 
-        # Try both base routes + both analyze styles (:analyze and /analyze)
         candidate_urls = [
             f"{endpoint}/documentintelligence/documentModels/{DI_MODEL}:analyze?api-version={DI_API_VERSION}",
             f"{endpoint}/documentintelligence/documentModels/{DI_MODEL}/analyze?api-version={DI_API_VERSION}",
@@ -88,7 +99,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         op_url = r.headers.get("operation-location") or r.headers.get("Operation-Location")
         if not op_url:
             return func.HttpResponse(
-                json.dumps({"error": "Missing Operation-Location from Document Intelligence", "used_url": used_url}),
+                json.dumps({
+                    "error": "Missing Operation-Location from Document Intelligence",
+                    "used_url": used_url
+                }),
                 status_code=502,
                 mimetype="application/json",
             )
@@ -108,7 +122,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "di_start_url": used_url,
         }
 
-        cont.upload_blob(f"jobs/{job_id}.json", json.dumps(job_record), overwrite=True)
+        cont.upload_blob(
+            f"jobs/{job_id}.json",
+            json.dumps(job_record),
+            overwrite=True
+        )
 
         return func.HttpResponse(
             json.dumps({"job_id": job_id}),
@@ -118,7 +136,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
     except Exception as e:
         return func.HttpResponse(
-            json.dumps({"error": "mailbills_parse_start crashed", "detail": str(e)}),
+            json.dumps({
+                "error": "mailbills_parse_start crashed",
+                "detail": str(e)
+            }),
             status_code=500,
             mimetype="application/json",
         )
