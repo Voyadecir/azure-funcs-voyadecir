@@ -11,39 +11,39 @@ from azure.storage.blob import (
 )
 
 CONTAINER = "mailbills"
-UPLOAD_TTL_SECONDS = 15 * 60  # 15 minutes
+UPLOAD_TTL_MINUTES = int(os.environ.get("UPLOAD_TTL_MINUTES", "30"))  # safer than 15
 
 
 def _parse_conn_string(cs: str) -> dict:
-    parts = {}
-    for chunk in cs.split(";"):
-        if "=" in chunk:
-            k, v = chunk.split("=", 1)
-            parts[k] = v
-    return parts
-
-
-def _container():
-    cs = os.environ["AzureWebJobsStorage"]
-    bs = BlobServiceClient.from_connection_string(cs)
-    return bs.get_container_client(CONTAINER)
+    """
+    Robust connection string parser (AccountKey contains '=' so never naive-split it).
+    """
+    out = {}
+    for chunk in (cs or "").split(";"):
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            continue
+        k, v = chunk.split("=", 1)
+        out[k] = v
+    return out
 
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
     try:
+        # Optional: accept filename/content_type from client for nicer blob naming/logging
+        try:
+            body = req.get_json()
+        except Exception:
+            body = {}
+
+        filename = (body.get("filename") or "upload.bin").strip()
+        content_type = (body.get("content_type") or "application/octet-stream").strip()
+
+        # Create a job id that the frontend and later steps can use
         job_id = str(uuid.uuid4())
 
-        cont = _container()
-        try:
-            cont.create_container()
-        except Exception:
-            pass
-
-        # We store uploads under uploads/<job_id>
-        blob_name = f"uploads/{job_id}"
-        blob_client = cont.get_blob_client(blob_name)
-
-        # Pull account name/key from the storage connection string
+        # Storage client
         cs = os.environ["AzureWebJobsStorage"]
         cs_parts = _parse_conn_string(cs)
         account_name = cs_parts.get("AccountName")
@@ -52,38 +52,58 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         if not account_name or not account_key:
             raise RuntimeError("AzureWebJobsStorage missing AccountName or AccountKey")
 
-        expiry = datetime.utcnow() + timedelta(seconds=UPLOAD_TTL_SECONDS)
+        service = BlobServiceClient.from_connection_string(cs)
+        container = service.get_container_client(CONTAINER)
 
-        # SAS for browser upload (PUT). Needs create+write.
+        # Ensure container exists
+        try:
+            container.create_container()
+        except Exception:
+            pass
+
+        # Keep the blob name deterministic per job
+        # Put under uploads/ so later agents can find it.
+        blob_name = f"uploads/{job_id}"
+        blob_client = container.get_blob_client(blob_name)
+
+        expiry = datetime.utcnow() + timedelta(minutes=UPLOAD_TTL_MINUTES)
+
+        # 1) Browser upload SAS (PUT BlockBlob): needs create + write
         upload_sas = generate_blob_sas(
             account_name=account_name,
-            container_name=cont.container_name,
-            blob_name=blob_name,
             account_key=account_key,
+            container_name=CONTAINER,
+            blob_name=blob_name,
             permission=BlobSasPermissions(create=True, write=True),
             expiry=expiry,
         )
 
-        # SAS for DI + server-side reads. Needs read.
+        # 2) Read SAS (for DI + private tab download): needs read
         read_sas = generate_blob_sas(
             account_name=account_name,
-            container_name=cont.container_name,
-            blob_name=blob_name,
             account_key=account_key,
+            container_name=CONTAINER,
+            blob_name=blob_name,
             permission=BlobSasPermissions(read=True),
             expiry=expiry,
         )
 
         upload_url = f"{blob_client.url}?{upload_sas}"
-        blob_url = f"{blob_client.url}?{read_sas}"  # IMPORTANT: this is what DI must use
+        blob_url = f"{blob_client.url}?{read_sas}"
 
         return func.HttpResponse(
             json.dumps(
                 {
+                    # REQUIRED by your frontend
                     "job_id": job_id,
                     "upload_url": upload_url,
                     "blob_url": blob_url,
+
+                    # Extra debug/helpful fields (won’t break anything)
+                    "blob_name": blob_name,
                     "expires_utc": expiry.isoformat() + "Z",
+                    "content_type": content_type,
+                    "filename": filename,
                 }
             ),
             status_code=200,
